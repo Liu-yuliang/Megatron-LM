@@ -21,10 +21,12 @@ from ..model_parallel_config import ModelParallelConfig
 from ..utils import (
     get_te_version,
     init_method_normal,
+    init_method_truncated_normal,
     is_te_min_version,
     is_torch_min_version,
     mup_scaled_init_method_normal,
     scaled_init_method_normal,
+    scaled_init_method_truncated_normal,
 )
 
 logger = logging.getLogger(__name__)
@@ -328,6 +330,12 @@ class TransformerConfig(ModelParallelConfig):
     init_method_std: float = 0.02
     """Standard deviation of the zero mean normal for the default initialization method, not used if
     init_method and output_layer_init_method are provided."""
+
+    init_method_variant: Literal["normal", "scaled_truncated_normal"] = "normal"
+    """Default initialization family used when init_method and output_layer_init_method are not
+    provided. "normal" keeps Megatron's standard N(0, init_method_std) behavior. The
+    "scaled_truncated_normal" variant uses base std sqrt(2/(5*hidden_size)), truncated to +/-3
+    sigma, and applies the usual output-layer depth scaling."""
 
     embedding_init_method: Optional[Callable] = None
     """
@@ -1821,12 +1829,21 @@ class TransformerConfig(ModelParallelConfig):
         # embedding_init_method is set here using the unscaled init_method_std, while
         # init_method (set below) gets MuP width-scaling. This ordering ensures embeddings
         # use the base (unscaled) initialization as required by MuP.
+        if self.init_method_variant == "scaled_truncated_normal":
+            if self.use_mup:
+                raise ValueError("scaled_truncated_normal initialization is not implemented for MuP.")
+            base_init_std = math.sqrt(2.0 / (5.0 * self.hidden_size))
+        else:
+            base_init_std = self.init_method_std
+
         if self.embedding_init_method_std is None:
             # By default, use the same init std as you use for every other non-output layer.
-            self.embedding_init_method_std = self.init_method_std
+            self.embedding_init_method_std = base_init_std
 
         if self.embedding_init_method is None:
-            if self.init_method is None or (self.embedding_init_method_std != self.init_method_std):
+            if self.init_method_variant == "scaled_truncated_normal":
+                self.embedding_init_method = init_method_truncated_normal(self.embedding_init_method_std)
+            elif self.init_method is None or (self.embedding_init_method_std != self.init_method_std):
                 # In this case, we set both the init method and the embedding init method to
                 #  whatever std value requested (or defaulted) for the embedding_init_layer
                 self.embedding_init_method = init_method_normal(self.embedding_init_method_std)
@@ -1838,7 +1855,9 @@ class TransformerConfig(ModelParallelConfig):
                 self.embedding_init_method = self.init_method
 
         if self.init_method is None:
-            if self.use_mup:
+            if self.init_method_variant == "scaled_truncated_normal":
+                self.init_method = init_method_truncated_normal(base_init_std)
+            elif self.use_mup:
                 # MuP: scale std by 1/sqrt(width_mult).
                 self.init_method = init_method_normal(
                     self.init_method_std / math.sqrt(self.mup_width_mult)
@@ -1847,7 +1866,13 @@ class TransformerConfig(ModelParallelConfig):
                 self.init_method = init_method_normal(self.init_method_std)
 
         if self.output_layer_init_method is None:
-            if self.use_mup:
+            if self.init_method_variant == "scaled_truncated_normal":
+                self.output_layer_init_method = scaled_init_method_truncated_normal(
+                    base_init_std,
+                    self.num_layers,
+                    multiplier=2.0 if not self.is_hybrid_model else 1.0,
+                )
+            elif self.use_mup:
                 # MuP: depth and width scaling for output layers.
                 self.output_layer_init_method = mup_scaled_init_method_normal(
                     self.init_method_std,

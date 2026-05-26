@@ -20,6 +20,7 @@ from functools import partial
 from typing import Any, List, Optional, Tuple
 
 import torch
+from torch.distributed.nn.functional import all_gather as differentiable_all_gather
 
 from gpt_builders import gpt_builder
 from megatron.core import parallel_state
@@ -33,7 +34,9 @@ from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.utils import get_attr_wrapped_model, get_thd_batch_on_this_cp_rank, get_batch_on_this_hybrid_cp_rank, StragglerDetector
 from megatron.training import (
     get_args,
+    get_tensorboard_writer,
     get_timers,
+    get_wandb_writer,
     inprocess_restart,
     pretrain,
     print_rank_0,
@@ -166,6 +169,283 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
 
 # define spiky loss as a loss that's 10x the max loss observed
 SPIKY_LOSS_FACTOR = 10
+_EXIT_HIDDEN_RANK_LAST_LOGGED_STEP = None
+
+
+def _env_int(name: str, default: int) -> int:
+    value = os.environ.get(name, "")
+    if not value:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    value = os.environ.get(name, "")
+    if not value:
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        return default
+
+
+def _current_train_step(args) -> int:
+    iteration = getattr(args, "curr_iteration", None)
+    if iteration is None:
+        iteration = getattr(args, "iteration", -1)
+    return int(iteration) + 1
+
+
+def _should_monitor_exit_hidden_rank(args) -> bool:
+    interval = _env_int("HIDDEN_RANK_LOG_INTERVAL", 0)
+    if interval <= 0:
+        return False
+    step = _current_train_step(args)
+    return step > 0 and step % interval == 0
+
+
+def _dist_rank_info() -> dict:
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return {
+            "rank": 0,
+            "world_size": 1,
+            "tp_rank": 0,
+            "pp_rank": 0,
+            "dp_rank": 0,
+            "cp_rank": 0,
+        }
+    info = {
+        "rank": torch.distributed.get_rank(),
+        "world_size": torch.distributed.get_world_size(),
+    }
+    for key, getter in (
+        ("tp_rank", parallel_state.get_tensor_model_parallel_rank),
+        ("pp_rank", parallel_state.get_pipeline_model_parallel_rank),
+        ("dp_rank", parallel_state.get_data_parallel_rank),
+        ("cp_rank", parallel_state.get_context_parallel_rank),
+    ):
+        try:
+            info[key] = getter()
+        except Exception:
+            info[key] = None
+    return info
+
+
+def _is_exit_hidden_rank_logger_rank() -> bool:
+    rank_info = _dist_rank_info()
+    return rank_info["rank"] == rank_info["world_size"] - 1
+
+
+def _append_exit_hidden_rank_json(record: dict) -> None:
+    path = os.environ.get("HIDDEN_RANK_LOG_PATH")
+    if not path:
+        return
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, sort_keys=True) + "\n")
+
+
+def _log_exit_hidden_rank_metrics(metrics: dict, step: int) -> None:
+    writer = get_tensorboard_writer()
+    if writer is not None:
+        for key, value in metrics.items():
+            if isinstance(value, (int, float)):
+                writer.add_scalar(key, value, step)
+    wandb_writer = get_wandb_writer()
+    if wandb_writer is not None:
+        wandb_writer.log(metrics, step)
+
+
+def _log_scalar_metrics(metrics: dict, step: int) -> None:
+    writer = get_tensorboard_writer()
+    if writer is not None:
+        for key, value in metrics.items():
+            writer.add_scalar(key, value, step)
+    wandb_writer = get_wandb_writer()
+    if wandb_writer is not None:
+        wandb_writer.log(metrics, step)
+
+
+def _maybe_log_exit_hidden_rank(hidden_states: torch.Tensor) -> None:
+    global _EXIT_HIDDEN_RANK_LAST_LOGGED_STEP
+    args = get_args()
+    if not _should_monitor_exit_hidden_rank(args):
+        return
+    step = _current_train_step(args)
+    if _EXIT_HIDDEN_RANK_LAST_LOGGED_STEP == step:
+        return
+    if not _is_exit_hidden_rank_logger_rank():
+        return
+    _EXIT_HIDDEN_RANK_LAST_LOGGED_STEP = step
+
+    max_tokens = max(1, _env_int("HIDDEN_RANK_LOG_TOKENS", 1024))
+    rtol = max(0.0, _env_float("HIDDEN_RANK_RTOL", 1.0e-3))
+    center = os.environ.get("HIDDEN_RANK_CENTER", "1") != "0"
+    rank_info = _dist_rank_info()
+    metrics = {}
+
+    with torch.no_grad():
+        hidden = hidden_states.detach()
+        hidden_size = int(hidden.shape[-1])
+        matrix = hidden.reshape(-1, hidden_size)
+        local_tokens = int(matrix.shape[0])
+        if local_tokens > max_tokens:
+            indices = torch.linspace(
+                0, local_tokens - 1, steps=max_tokens, device=matrix.device
+            ).long()
+            matrix = matrix.index_select(0, indices)
+        matrix = matrix.float()
+
+        finite = torch.isfinite(matrix)
+        nan_count = int(torch.isnan(matrix).sum().item())
+        inf_count = int(torch.isinf(matrix).sum().item())
+        finite_rows = finite.all(dim=-1)
+        finite_row_count = int(finite_rows.sum().item())
+        sample_tokens = int(matrix.shape[0])
+
+        metrics.update(
+            {
+                "exit_hidden/local_tokens": local_tokens,
+                "exit_hidden/sample_tokens": sample_tokens,
+                "exit_hidden/finite_sample_tokens": finite_row_count,
+                "exit_hidden/hidden_size": hidden_size,
+                "exit_hidden/nan_count": nan_count,
+                "exit_hidden/inf_count": inf_count,
+            }
+        )
+
+        if finite_row_count == 0:
+            metrics["exit_hidden/numerical_rank"] = 0
+            record = {"step": step, **rank_info, **metrics}
+            _append_exit_hidden_rank_json(record)
+            _log_exit_hidden_rank_metrics(metrics, step)
+            return
+
+        matrix = matrix[finite_rows]
+        metrics.update(
+            {
+                "exit_hidden/rms": float(torch.sqrt(matrix.square().mean()).item()),
+                "exit_hidden/mean_abs": float(matrix.abs().mean().item()),
+                "exit_hidden/max_abs": float(matrix.abs().max().item()),
+                "exit_hidden/token_norm_mean": float(torch.linalg.vector_norm(matrix, dim=-1).mean().item()),
+            }
+        )
+
+        if center and matrix.shape[0] > 1:
+            matrix = matrix - matrix.mean(dim=0, keepdim=True)
+
+        try:
+            singular_values = torch.linalg.svdvals(matrix)
+            singular_values = singular_values[torch.isfinite(singular_values)]
+            if singular_values.numel() == 0 or singular_values[0].item() <= 0.0:
+                numeric_rank = 0
+                effective_rank = 0.0
+                stable_rank = 0.0
+                top_sv = 0.0
+                median_sv = 0.0
+                min_sv = 0.0
+            else:
+                threshold = singular_values[0] * rtol
+                numeric_rank = int((singular_values > threshold).sum().item())
+                spectrum_sum = singular_values.sum()
+                probabilities = singular_values / spectrum_sum.clamp_min(1.0e-30)
+                entropy = -(probabilities * probabilities.clamp_min(1.0e-30).log()).sum()
+                effective_rank = float(torch.exp(entropy).item())
+                stable_rank = float(
+                    (singular_values.square().sum() / singular_values[0].square()).item()
+                )
+                top_sv = float(singular_values[0].item())
+                median_sv = float(singular_values[singular_values.numel() // 2].item())
+                min_sv = float(singular_values[-1].item())
+            metrics.update(
+                {
+                    "exit_hidden/numerical_rank": numeric_rank,
+                    "exit_hidden/effective_rank": effective_rank,
+                    "exit_hidden/stable_rank": stable_rank,
+                    "exit_hidden/top_singular_value": top_sv,
+                    "exit_hidden/median_singular_value": median_sv,
+                    "exit_hidden/min_singular_value": min_sv,
+                    "exit_hidden/rank_rtol": rtol,
+                    "exit_hidden/centered": int(center),
+                }
+            )
+        except RuntimeError as exc:
+            metrics["exit_hidden/rank_error"] = str(exc)[:200]
+
+    record = {"step": step, **rank_info, **metrics}
+    _append_exit_hidden_rank_json(record)
+    _log_exit_hidden_rank_metrics(metrics, step)
+
+
+def exit_hidden_rank_output_processor(
+    hidden_states,
+    output_layer,
+    output_weight,
+    labels,
+    runtime_gather_output,
+    compute_language_model_loss,
+    scale_logits,
+    **_kwargs,
+):
+    _maybe_log_exit_hidden_rank(hidden_states)
+    logits, _ = output_layer(
+        hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
+    )
+    logits = scale_logits(logits)
+    if labels is None:
+        return logits.transpose(0, 1).contiguous()
+    return compute_language_model_loss(labels, logits)
+
+
+def olmo3_z_loss_output_processor(
+    hidden_states,
+    output_layer,
+    output_weight,
+    labels,
+    runtime_gather_output,
+    compute_language_model_loss,
+    scale_logits,
+    loss_mask=None,
+    **_kwargs,
+):
+    _maybe_log_exit_hidden_rank(hidden_states)
+    logits, _ = output_layer(
+        hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
+    )
+    logits = scale_logits(logits)
+    if labels is None:
+        return logits.transpose(0, 1).contiguous()
+
+    z_loss_multiplier = _env_float("OLMO3_Z_LOSS_MULTIPLIER", 0.0)
+    if z_loss_multiplier > 0.0:
+        # OLMo applies dense LM z-loss: square(logsumexp(logits)).
+        if parallel_state.get_tensor_model_parallel_world_size() > 1:
+            gathered = differentiable_all_gather(logits, group=parallel_state.get_tensor_model_parallel_group())
+            logits_for_z_loss = torch.cat(tuple(gathered), dim=-1)
+        else:
+            logits_for_z_loss = logits
+        z_losses = torch.logsumexp(logits_for_z_loss, dim=-1).square() * z_loss_multiplier
+        z_losses = z_losses.transpose(0, 1).contiguous()
+    else:
+        z_losses = None
+
+    lm_losses = compute_language_model_loss(labels, logits)
+    if z_losses is None:
+        return lm_losses
+
+    step = _current_train_step(get_args())
+    if loss_mask is not None and _is_exit_hidden_rank_logger_rank():
+        with torch.no_grad():
+            mask = loss_mask.float()
+            denom = mask.sum().clamp_min(1.0)
+            _log_scalar_metrics(
+                {"olmo3_z_loss": float((z_losses.detach() * mask).sum().item() / denom.item())},
+                step,
+            )
+    return lm_losses + z_losses
 
 
 def loss_func(
@@ -258,8 +538,17 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
             )
             return schedule_plan, partial(loss_func, loss_mask, model=model)
         else:
+            output_processor = None
+            if _should_monitor_exit_hidden_rank(args) or _env_float("OLMO3_Z_LOSS_MULTIPLIER", 0.0) > 0.0:
+                output_processor = olmo3_z_loss_output_processor
             output_tensor = model(
-                tokens, position_ids, attention_mask, labels=labels, loss_mask=loss_mask, packed_seq_params=packed_seq_params
+                tokens,
+                position_ids,
+                attention_mask,
+                labels=labels,
+                loss_mask=loss_mask,
+                packed_seq_params=packed_seq_params,
+                output_processor=output_processor,
             )
 
     # [ModelOpt]: model is needed to access ModelOpt distillation losses

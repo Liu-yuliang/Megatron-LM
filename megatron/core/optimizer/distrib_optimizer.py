@@ -1770,9 +1770,22 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         f'.gbuf_idx_{gbuf_idx}.dtype_{dtype}.bucket_idx_{bucket_idx}'
                     )
 
-                    # The global ckpt tensors must be fully covered.
-                    # We add extra empty padding if necessary
-                    assert bucket_state, 'empty bucket encountered'
+                    # The global ckpt tensors must be fully covered. A DP-local shard can be
+                    # entirely bucket-end padding when a tiny bucket is padded for DP/NCCL
+                    # alignment; in that case this rank has nothing to contribute.
+                    if not bucket_state:
+                        gbuf_local_start_world = data_parallel_rank * gbuf_local_numel
+                        if gbuf_local_start_world >= gbuf_world_numel_unpadded:
+                            continue
+                        raise AssertionError(
+                            'empty bucket encountered inside unpadded optimizer bucket: '
+                            f'gbuf_idx={gbuf_idx}, dtype={dtype}, bucket_idx={bucket_idx}, '
+                            f'dp_rank={data_parallel_rank}, dp_world_size={data_parallel_world_size}, '
+                            f'local_start={gbuf_local_start_world}, '
+                            f'local_numel={gbuf_local_numel}, '
+                            f'world_numel_unpadded={gbuf_world_numel_unpadded}, '
+                            f'world_numel={gbuf_world_numel}'
+                        )
 
                     # Insert padding between parameter tensors to ensure full coverage as needed.
                     all_pad_tensors = {}

@@ -771,11 +771,29 @@ def init_method_normal(sigma):
     return functools.partial(torch.nn.init.normal_, mean=0.0, std=sigma)
 
 
+def init_method_truncated_normal(sigma, truncation=3.0):
+    """Init method based on truncated N(0, sigma), clipped to +/- truncation sigma."""
+    return functools.partial(
+        torch.nn.init.trunc_normal_,
+        mean=0.0,
+        std=sigma,
+        a=-truncation * sigma,
+        b=truncation * sigma,
+    )
+
+
 def scaled_init_method_normal(sigma, num_layers, multiplier=2.0):
     """Init method based on N(0, sigma/sqrt(2*num_layers)."""
     std = sigma / math.sqrt(multiplier * num_layers)
 
     return functools.partial(torch.nn.init.normal_, mean=0.0, std=std)
+
+
+def scaled_init_method_truncated_normal(sigma, num_layers, multiplier=2.0, truncation=3.0):
+    """Init method based on truncated N(0, sigma/sqrt(2*num_layers))."""
+    std = sigma / math.sqrt(multiplier * num_layers)
+
+    return init_method_truncated_normal(std, truncation=truncation)
 
 
 def mup_scaled_init_method_normal(sigma, num_layers, width_mult, multiplier=2.0):

@@ -1,6 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 import copy
 import logging
+import os
 import warnings
 from collections import defaultdict
 from dataclasses import astuple
@@ -116,6 +117,16 @@ def get_standard_config_overrides(config: OptimizerConfig) -> Dict[ParamKey, Par
         param_wd_mult_key = ParamKey(name="*.bias", predicate=param_length_1_match)
 
     config_overrides[param_wd_mult_key] = ParamGroupOverride(wd_mult=0.0)
+
+    if os.getenv("OLMO3_EMBEDDING_WEIGHT_DECAY_ZERO", "0").lower() in ("1", "true", "yes"):
+        embedding_param = ParamWithNamePredicate(
+            name="olmo3_embedding_weight_decay_zero",
+            fn=lambda param, name: name.endswith("embedding.word_embeddings.weight")
+            or name.endswith("embeddings.weight"),
+        )
+        config_overrides[ParamKey(with_name_predicate=embedding_param)] = ParamGroupOverride(
+            wd_mult=0.0
+        )
 
     if config.decoupled_lr is not None:
         decoupled_lr_config: ParamGroupOverride = {"max_lr": config.decoupled_lr}

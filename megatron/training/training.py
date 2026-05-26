@@ -119,6 +119,32 @@ RL_LOGGABLE_TIMER_NAMES = [
     'rl/wait-for-decode-only',
 ]
 
+_DEFAULT_H200_BF16_PEAK_TFLOPS_PER_GPU = 989.0
+_DEFAULT_H200_FP8_PEAK_TFLOPS_PER_GPU = 1979.0
+
+
+def _get_default_mfu_peak_tflops_per_gpu(args):
+    if getattr(args, 'fp8', None):
+        return _DEFAULT_H200_FP8_PEAK_TFLOPS_PER_GPU
+    return _DEFAULT_H200_BF16_PEAK_TFLOPS_PER_GPU
+
+
+def _get_mfu_peak_tflops_per_gpu(args):
+    peak = os.environ.get('MEGATRON_MFU_PEAK_TFLOPS_PER_GPU')
+    if peak is None:
+        return _get_default_mfu_peak_tflops_per_gpu(args)
+    try:
+        peak = float(peak)
+    except ValueError:
+        return _get_default_mfu_peak_tflops_per_gpu(args)
+    return peak if peak > 0.0 else _get_default_mfu_peak_tflops_per_gpu(args)
+
+
+def _format_eta_seconds(seconds):
+    if not math.isfinite(seconds) or seconds < 0.0:
+        return 'unknown'
+    return str(timedelta(seconds=int(round(seconds))))
+
 try:
     from modelopt.torch.distill.plugins.megatron import (
         get_tensor_shapes_adjust_fn_for_distillation,
@@ -150,6 +176,8 @@ from megatron.core.pipeline_parallel.utils import (
     is_vp_last_stage,
 )
 from megatron.core.optimizer import get_mup_config_overrides, get_standard_config_overrides
+from megatron.core.optimizer import ParamKey, ParamWithNamePredicate
+from megatron.core.optimizer_param_scheduler import ParamGroupOverride
 from megatron.training.checkpointing import load_checkpoint
 from megatron.training.checkpointing import save_checkpoint, save_grads
 from megatron.training.checkpointing import checkpoint_exists
@@ -1183,6 +1211,35 @@ def pretrain(
 
         iteration = 0
         args.curr_iteration = iteration
+        if (
+            os.environ.get('SAVE_STEP0', '0').lower() in ('1', 'true', 'yes', 'on')
+            and args.do_train
+            and args.iteration == 0
+            and cfg_container.checkpoint.save
+        ):
+            print_rank_0('saving checkpoint at iteration 0 because SAVE_STEP0=1')
+            step0_no_save_optim = args.no_save_optim
+            step0_no_save_rng = args.no_save_rng
+            try:
+                # Adam state is not initialized before the first optimizer step.
+                # Keep the requested initial checkpoint model-only; regular
+                # training checkpoints restore optimizer/RNG state as configured.
+                args.no_save_optim = True
+                args.no_save_rng = True
+                save_checkpoint(
+                    0,
+                    model,
+                    optimizer,
+                    opt_param_scheduler,
+                    args.num_floating_point_operations_so_far,
+                    checkpointing_context,
+                    train_data_iterator=train_data_iterator,
+                    preprocess_common_state_dict_fn=preprocess_common_state_dict,
+                )
+            finally:
+                args.no_save_optim = step0_no_save_optim
+                args.no_save_rng = step0_no_save_rng
+            torch.distributed.barrier()
         if args.do_train and (args.train_iters or 0) > 0:
             iteration, num_floating_point_operations_so_far = train(
                 forward_step_func,
@@ -1612,6 +1669,31 @@ def get_megatron_optimizer_config(args: Any) -> OptimizerConfig:
     # Construct the appropriate config_overrides object. This default handles many cases, but
     #  can be added to as needed by the user, or replaced entirely with a custom override.
     config_overrides = get_standard_config_overrides(config=config)
+
+    v22_vq_lr_mult = float(getattr(args, "conceptlm_v22_vq_lr_mult", 1.0) or 1.0)
+    v22_vq_highlevel_lr_mult = float(
+        getattr(args, "conceptlm_v22_vq_highlevel_lr_mult", 1.0) or 1.0
+    )
+    if v22_vq_lr_mult != 1.0:
+        vq_param = ParamWithNamePredicate(
+            name="conceptlm_v22_vq_params",
+            fn=lambda param, name: (
+                "concept_quantizer." in name or "concept_vq_input_norm." in name
+            ),
+        )
+        config_overrides[ParamKey(with_name_predicate=vq_param)] = ParamGroupOverride(
+            max_lr=config.lr * v22_vq_lr_mult,
+            min_lr=config.min_lr * v22_vq_lr_mult,
+        )
+    if v22_vq_highlevel_lr_mult != 1.0:
+        highlevel_param = ParamWithNamePredicate(
+            name="conceptlm_v22_vq_highlevel_params",
+            fn=lambda param, name: "concept_predictor." in name,
+        )
+        config_overrides[ParamKey(with_name_predicate=highlevel_param)] = ParamGroupOverride(
+            max_lr=config.lr * v22_vq_highlevel_lr_mult,
+            min_lr=config.min_lr * v22_vq_highlevel_lr_mult,
+        )
 
     return config, config_overrides
 
@@ -2279,7 +2361,12 @@ def training_log(
                 writer.add_scalar('iteration-time', elapsed_time_per_iteration, iteration)
             if wandb_writer:
                 wandb_writer.log({'iteration-time': elapsed_time_per_iteration}, iteration)
-        log_string = f" [{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')}]"
+        now = datetime.now()
+        remaining_iterations = max(args.train_iters - iteration, 0)
+        eta_seconds = remaining_iterations * elapsed_time_per_iteration
+        eta_finish_time = now + timedelta(seconds=eta_seconds)
+
+        log_string = f" [{now.strftime('%Y-%m-%d %H:%M:%S.%f')}]"
         log_string += ' iteration {:8d}/{:8d} |'.format(iteration, args.train_iters)
         log_string += ' consumed samples: {:12d} |'.format(args.consumed_train_samples)
         if has_rl_utils and args.rl_use_sequence_packing:
@@ -2289,13 +2376,43 @@ def training_log(
         log_string += ' elapsed time per iteration (ms): {:.1f} |'.format(
             elapsed_time_per_iteration * 1000.0
         )
+        log_string += ' remaining iterations: {:8d} |'.format(remaining_iterations)
+        log_string += f' estimated remaining time: {_format_eta_seconds(eta_seconds)} |'
+        log_string += f" estimated finish time: {eta_finish_time.strftime('%Y-%m-%d %H:%M:%S')} |"
+        if args.log_timers_to_tensorboard and not is_first_iteration:
+            if writer:
+                writer.add_scalar('eta-remaining-hours', eta_seconds / 3600.0, iteration)
+            if wandb_writer:
+                wandb_writer.log({'eta-remaining-hours': eta_seconds / 3600.0}, iteration)
         if args.log_throughput:
             log_string += f' throughput per GPU (TFLOP/s/GPU): {throughput:.1f} |'
+            tps_per_gpu = batch_size * args.seq_length / elapsed_time_per_iteration / args.world_size
+            tokens_per_step = batch_size * args.seq_length
+            global_tps = tokens_per_step / elapsed_time_per_iteration
+            consumed_tokens = args.consumed_train_samples * args.seq_length
+            mfu_peak_tflops_per_gpu = _get_mfu_peak_tflops_per_gpu(args)
+            mfu = throughput / mfu_peak_tflops_per_gpu * 100.0
+            log_string += f' tps per GPU: {tps_per_gpu:.1f} |'
+            log_string += f' global tps: {global_tps:.1f} |'
+            log_string += f' consumed tokens: {consumed_tokens} |'
+            log_string += (
+                f' MFU (H200 peak {mfu_peak_tflops_per_gpu:.0f} TFLOP/s/GPU): {mfu:.1f}% |'
+            )
             if args.log_timers_to_tensorboard:
                 if writer:
                     writer.add_scalar('throughput', throughput, iteration)
+                    writer.add_scalar('tps-per-gpu', tps_per_gpu, iteration)
+                    writer.add_scalar('tokens-per-second-global', global_tps, iteration)
+                    writer.add_scalar('tokens-per-step-global', tokens_per_step, iteration)
+                    writer.add_scalar('consumed-tokens', consumed_tokens, iteration)
+                    writer.add_scalar('mfu-h200-percent', mfu, iteration)
                 if wandb_writer:
                     wandb_writer.log({'throughput': throughput}, iteration)
+                    wandb_writer.log({'tps-per-gpu': tps_per_gpu}, iteration)
+                    wandb_writer.log({'tokens-per-second-global': global_tps}, iteration)
+                    wandb_writer.log({'tokens-per-step-global': tokens_per_step}, iteration)
+                    wandb_writer.log({'consumed-tokens': consumed_tokens}, iteration)
+                    wandb_writer.log({'mfu-h200-percent': mfu}, iteration)
         if args.log_energy:
             energy = (energy_monitor.lap() / total_iterations) / args.world_size
             power = energy / elapsed_time_per_iteration
@@ -3703,6 +3820,14 @@ def cyclic_iter(iterable):
             )
 
 
+def _eval_iters_enabled(eval_iters):
+    if eval_iters is None:
+        return False
+    if isinstance(eval_iters, (list, tuple)):
+        return any(it is not None and it > 0 for it in eval_iters)
+    return eval_iters > 0
+
+
 def get_train_valid_test_num_samples():
     """Train/valid/test num samples."""
 
@@ -3716,7 +3841,9 @@ def get_train_valid_test_num_samples():
     if args.full_validation:
         eval_samples = None
     else:
-        if args.skip_train:
+        if args.eval_interval is None or not _eval_iters_enabled(args.eval_iters):
+            eval_iters = 0
+        elif args.skip_train:
             eval_iters = args.eval_iters
         else:
             assert args.train_iters is not None
@@ -3726,7 +3853,11 @@ def get_train_valid_test_num_samples():
                 total_eval_points = max(0, total_eval_points - skipped_eval_points)
             eval_iters = total_eval_points * args.eval_iters
         eval_samples = eval_iters * getattr(args, 'eval_global_batch_size', args.global_batch_size)
-    test_samples = args.eval_iters * getattr(args, 'eval_global_batch_size', args.global_batch_size)
+    test_samples = (
+        args.eval_iters * getattr(args, 'eval_global_batch_size', args.global_batch_size)
+        if _eval_iters_enabled(args.eval_iters)
+        else 0
+    )
 
     # Get train_samples in current phase.
     if args.phase_transition_iterations:
@@ -3798,33 +3929,38 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
             valid_dataloaders = None
             test_dataloader = None
             do_train = (args.train_iters or 0) > 0
-            do_valid = (args.full_validation or args.eval_iters > 0)
-            do_test = (args.full_validation or args.eval_iters > 0)
+            do_valid = args.full_validation or _eval_iters_enabled(args.eval_iters)
+            do_test = args.full_validation or _eval_iters_enabled(args.eval_iters)
 
         else:
+            should_build_eval = args.full_validation or _eval_iters_enabled(args.eval_iters)
             # Build datasets.
             train_ds, valid_ds, test_ds = build_train_valid_test_datasets(build_train_valid_test_datasets_provider)
-            valid_ds = [valid_ds] if not isinstance(valid_ds, list) else valid_ds
             if args.skip_train:
                 train_dataloader = None
             else:
                 train_dataloader = build_pretraining_data_loader(train_ds, consumed_train_samples_in_current_phase)
-            valid_dataloaders = []
-            for valid_d in valid_ds:
-                if args.skip_train or args.full_validation:
-                    valid_dataloaders.append(build_pretraining_data_loader(valid_d, 0))
-                else:
-                    if args.multiple_validation_sets:
-                        # TODO(bnorick): for multiple validation sets without full validation, args.consumed_valid_samples is not
-                        # correct and needs to be calculated/set per validation set
-                        raise NotImplementedError("--multiple-validation-sets currently requires --full-validation")
-                    valid_dataloaders.append(build_pretraining_data_loader(valid_d, args.consumed_valid_samples))
-            if not args.multiple_validation_sets:
-                assert len(valid_dataloaders) == 1
-            test_dataloader = build_pretraining_data_loader(test_ds, 0)
+            if should_build_eval:
+                valid_ds = [valid_ds] if not isinstance(valid_ds, list) else valid_ds
+                valid_dataloaders = []
+                for valid_d in valid_ds:
+                    if args.skip_train or args.full_validation:
+                        valid_dataloaders.append(build_pretraining_data_loader(valid_d, 0))
+                    else:
+                        if args.multiple_validation_sets:
+                            # TODO(bnorick): for multiple validation sets without full validation, args.consumed_valid_samples is not
+                            # correct and needs to be calculated/set per validation set
+                            raise NotImplementedError("--multiple-validation-sets currently requires --full-validation")
+                        valid_dataloaders.append(build_pretraining_data_loader(valid_d, args.consumed_valid_samples))
+                if not args.multiple_validation_sets:
+                    assert len(valid_dataloaders) == 1
+                test_dataloader = build_pretraining_data_loader(test_ds, 0)
+            else:
+                valid_dataloaders = None
+                test_dataloader = None
             do_train = train_dataloader is not None and (args.skip_train or args.train_iters > 0)
-            do_valid = valid_dataloaders is not None and (args.full_validation or args.eval_iters > 0)
-            do_test = test_dataloader is not None and (args.full_validation or args.eval_iters > 0)
+            do_valid = valid_dataloaders is not None and should_build_eval
+            do_test = test_dataloader is not None and should_build_eval
 
         flags = torch.tensor(
             [int(do_train), int(do_valid), int(do_test)], dtype=torch.long, device='cuda'
