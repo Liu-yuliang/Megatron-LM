@@ -523,12 +523,12 @@ run_train() {
   fi
   if [[ "${ENABLE_WANDB:-1}" == "1" ]]; then
     logging_args+=(
-      --wandb-project "${WANDB_PROJECT:-public-training-bench}"
+      --wandb-project "${WANDB_PROJECT:-ConceptLM}"
       --wandb-exp-name "${WANDB_EXP_NAME:-$RUN_NAME}"
       --wandb-save-dir "$WANDB_SAVE_DIR"
     )
-    if [[ -n "${WANDB_ENTITY:-}" ]]; then
-      logging_args+=(--wandb-entity "$WANDB_ENTITY")
+    if [[ -n "${WANDB_ENTITY:-iammi-nanjing-university}" ]]; then
+      logging_args+=(--wandb-entity "${WANDB_ENTITY:-iammi-nanjing-university}")
     fi
   fi
 
@@ -564,7 +564,7 @@ run_train() {
     echo "attention_backend=$attention_backend"
     echo "wandb_enabled=${ENABLE_WANDB:-1}"
     echo "wandb_mode=$WANDB_MODE"
-    echo "wandb_project=${WANDB_PROJECT:-public-training-bench}"
+    echo "wandb_project=${WANDB_PROJECT:-ConceptLM}"
     echo "wandb_exp_name=${WANDB_EXP_NAME:-$RUN_NAME}"
     echo "wandb_save_dir=$WANDB_SAVE_DIR"
     echo "hidden_rank_log_interval=$HIDDEN_RANK_LOG_INTERVAL"

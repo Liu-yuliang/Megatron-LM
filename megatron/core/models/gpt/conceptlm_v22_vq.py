@@ -214,6 +214,9 @@ class ConceptLMV22VQModel(ConceptLMV21Model):
         concept_residual_flow_route_use_softmax: bool = True,
         concept_residual_flow_source_use_layernorm: bool = True,
         concept_residual_flow_shared_source_norm: bool = False,
+        concept_final_read_concept_gate: bool = False,
+        concept_final_read_concept_gate_init_final: float = 0.5,
+        concept_final_read_concept_gate_target_final: float = 0.5,
         concept_compile_residual_flow_routes: bool = False,
         concept_compile_dd_routes: bool = False,
         **kwargs: Any,
@@ -267,6 +270,9 @@ class ConceptLMV22VQModel(ConceptLMV21Model):
             concept_residual_flow_route_use_softmax=concept_residual_flow_route_use_softmax,
             concept_residual_flow_source_use_layernorm=concept_residual_flow_source_use_layernorm,
             concept_residual_flow_shared_source_norm=concept_residual_flow_shared_source_norm,
+            concept_final_read_concept_gate=concept_final_read_concept_gate,
+            concept_final_read_concept_gate_init_final=concept_final_read_concept_gate_init_final,
+            concept_final_read_concept_gate_target_final=concept_final_read_concept_gate_target_final,
             concept_compile_residual_flow_routes=concept_compile_residual_flow_routes,
             concept_compile_dd_routes=concept_compile_dd_routes,
             **kwargs,
@@ -339,13 +345,14 @@ class ConceptLMV22VQModel(ConceptLMV21Model):
             self.concept_encoder_layers + self.concept_decoder_layers + self.concept_special_layers
         )
         base_std, _ = _scaled_truncated_init_stds(hidden_size, total_layers)
-        nn.init.trunc_normal_(
-            self.concept_quantizer.codebook,
-            mean=0.0,
-            std=base_std,
-            a=-3.0 * base_std,
-            b=3.0 * base_std,
-        )
+        for codebook in self.concept_quantizer.codebook:
+            nn.init.trunc_normal_(
+                codebook,
+                mean=0.0,
+                std=base_std,
+                a=-3.0 * base_std,
+                b=3.0 * base_std,
+            )
         _reset_layernorm(self.concept_vq_input_norm)
         self.concept_predictor.reset_scaled_truncated_parameters(hidden_size, total_layers)
 

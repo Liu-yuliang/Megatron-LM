@@ -63,14 +63,49 @@ class SimVQProductQuantizer(nn.Module):
         self.head_dim = hidden_size // num_codebooks
         self.commitment_cost = commitment_cost
 
-        self.codebook = nn.Parameter(torch.empty(num_codebooks, codebook_size, self.head_dim))
+        self.codebook = nn.ParameterList(
+            [nn.Parameter(torch.empty(codebook_size, self.head_dim)) for _ in range(num_codebooks)]
+        )
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
-        nn.init.normal_(self.codebook, mean=0.0, std=0.02)
+        for codebook in self.codebook:
+            nn.init.normal_(codebook, mean=0.0, std=0.02)
 
     def transformed_codebook(self) -> Tensor:
-        return self.codebook
+        return torch.stack(tuple(self.codebook), dim=0)
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ) -> None:
+        legacy_key = prefix + "codebook"
+        if legacy_key in state_dict:
+            legacy_codebook = state_dict.pop(legacy_key)
+            expected_shape = (self.num_codebooks, self.codebook_size, self.head_dim)
+            if tuple(legacy_codebook.shape) != expected_shape:
+                error_msgs.append(
+                    f"size mismatch for {legacy_key}: copying a param with shape "
+                    f"{tuple(legacy_codebook.shape)} from checkpoint, expected {expected_shape}"
+                )
+            else:
+                for codebook_idx in range(self.num_codebooks):
+                    state_dict[f"{prefix}codebook.{codebook_idx}"] = legacy_codebook[codebook_idx]
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
 
     def forward(self, concept_hidden: Tensor) -> tuple[Tensor, Tensor, Tensor]:
         """Quantize concept hidden states.

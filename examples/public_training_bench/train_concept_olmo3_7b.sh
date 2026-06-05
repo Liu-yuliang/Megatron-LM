@@ -79,9 +79,9 @@ export HIDDEN_RANK_CENTER=1
 
 export ENABLE_WANDB=1
 export WANDB_MODE=offline
-export WANDB_PROJECT="${WANDB_PROJECT:-olmo3_mix_6T}"
-export WANDB_ENTITY="${WANDB_ENTITY:-liuyl03181-nju}"
-export WANDB_API_KEY="${WANDB_API_KEY:-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}"
+export WANDB_PROJECT="${WANDB_PROJECT:-ConceptLM}"
+export WANDB_ENTITY="${WANDB_ENTITY:-iammi-nanjing-university}"
+export WANDB_API_KEY="${WANDB_API_KEY:-}"
 export WANDB_EXP_NAME="${WANDB_EXP_NAME:-$JOB_NAME}"
 
 export EXTRA_ARGS="${EXTRA_ARGS:-} \

@@ -413,6 +413,7 @@ run_train() {
     --lr-decay-style cosine
     --clip-grad "${CLIP_GRAD:-1.0}"
     --weight-decay "${WEIGHT_DECAY:-0.1}"
+    --optimizer "${OPTIMIZER:-adam}"
     --adam-beta1 "${ADAM_BETA1:-0.9}"
     --adam-beta2 "${ADAM_BETA2:-0.95}"
     --adam-eps "${ADAM_EPS:-1.0e-8}"
@@ -433,10 +434,12 @@ run_train() {
     --attention-backend "$attention_backend"
     --use-distributed-optimizer
     --overlap-grad-reduce
-    --overlap-param-gather
     --ddp-bucket-size "${DDP_BUCKET_SIZE:-$([[ "$node_count" -ge 16 ]] && echo 480000000 || echo 240000000)}"
     --ddp-pad-buckets-for-high-nccl-busbw
   )
+  if [[ "${OVERLAP_PARAM_GATHER:-1}" == "1" ]]; then
+    parallel_args+=(--overlap-param-gather)
+  fi
   if [[ "${FUSED_RESIDUAL_RMSNORM:-$([[ "$transformer_impl" == "local" ]] && echo 0 || echo 1)}" == "1" ]]; then
     parallel_args+=(--fused-residual-rmsnorm)
   fi
@@ -460,12 +463,12 @@ run_train() {
   )
   if [[ "${ENABLE_WANDB:-1}" == "1" ]]; then
     logging_args+=(
-      --wandb-project "${WANDB_PROJECT:-public-training-bench}"
+      --wandb-project "${WANDB_PROJECT:-ConceptLM}"
       --wandb-exp-name "${WANDB_EXP_NAME:-$RUN_NAME}"
       --wandb-save-dir "$WANDB_SAVE_DIR"
     )
-    if [[ -n "${WANDB_ENTITY:-}" ]]; then
-      logging_args+=(--wandb-entity "$WANDB_ENTITY")
+    if [[ -n "${WANDB_ENTITY:-iammi-nanjing-university}" ]]; then
+      logging_args+=(--wandb-entity "${WANDB_ENTITY:-iammi-nanjing-university}")
     fi
   fi
 
@@ -502,9 +505,10 @@ run_train() {
     echo "init_method_std=${INIT_METHOD_STD:-0.02}"
     echo "wandb_enabled=${ENABLE_WANDB:-1}"
     echo "wandb_mode=$WANDB_MODE"
-    echo "wandb_project=${WANDB_PROJECT:-public-training-bench}"
+    echo "wandb_project=${WANDB_PROJECT:-ConceptLM}"
     echo "wandb_exp_name=${WANDB_EXP_NAME:-$RUN_NAME}"
     echo "wandb_save_dir=$WANDB_SAVE_DIR"
+    echo "optimizer=${OPTIMIZER:-adam}"
     echo "hidden_rank_log_interval=$HIDDEN_RANK_LOG_INTERVAL"
     echo "hidden_rank_log_tokens=$HIDDEN_RANK_LOG_TOKENS"
     echo "hidden_rank_rtol=$HIDDEN_RANK_RTOL"

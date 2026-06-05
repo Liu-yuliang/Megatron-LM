@@ -326,6 +326,18 @@ def _add_conceptlm_v21_args(parser):
         False,
         "Enable concept-to-decoder residual routes.",
     )
+    group.add_argument(
+        "--conceptlm-v21-concept-read-encoder-first-n",
+        type=int,
+        default=-1,
+        help="Apply encoder-to-concept residual routes only to the first N concept layers; negative means all enabled layers.",
+    )
+    group.add_argument(
+        "--conceptlm-v21-decoder-read-encoder-first-n",
+        type=int,
+        default=-1,
+        help="Apply encoder-to-decoder residual routes only to the first N decoder layers; negative means all enabled layers.",
+    )
     group.add_argument("--conceptlm-v21-residual-flow-beta-init", type=float, default=0.02)
     group.add_argument("--conceptlm-v21-residual-flow-route-hidden-size", type=int, default=0)
     _add_bool_pair(
@@ -345,6 +357,30 @@ def _add_conceptlm_v21_args(parser):
         "conceptlm-v21-residual-flow-shared-source-norm",
         False,
         "Share one source norm per residual-flow source group.",
+    )
+    _add_bool_pair(
+        group,
+        "conceptlm-v21-final-read-concept-gate",
+        False,
+        "Use a per-layer softmax gate whose final-concept and decoder-read-concept weights sum to 1.",
+    )
+    group.add_argument(
+        "--conceptlm-v21-final-read-concept-gate-init-final",
+        type=float,
+        default=0.5,
+        help="Initial final-concept share for the final/read-concept softmax gate.",
+    )
+    group.add_argument(
+        "--conceptlm-v21-final-read-concept-gate-target-final",
+        type=float,
+        default=0.5,
+        help="Target final-concept share used by the optional final/read-concept gate regularizer.",
+    )
+    group.add_argument(
+        "--conceptlm-v21-final-read-concept-gate-reg-weight",
+        type=float,
+        default=0.0,
+        help="Weight for the final/read-concept gate target regularizer.",
     )
     _add_bool_pair(
         group,
@@ -400,10 +436,21 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: ConceptLMV21Output, model=
     weighted_vq = raw_vq * args.conceptlm_vq_loss_weight
     weighted_hlm = raw_hlm * args.conceptlm_hlm_loss_weight
     aux_loss = weighted_vq + weighted_hlm
-    total_loss = token_loss + aux_loss
-
+    route_reg_raw = output_tensor.concept_metrics.get(
+        "conceptlm_v21/final_read_concept_gate_reg_raw",
+    )
+    if route_reg_raw is None:
+        route_reg_raw = token_loss.new_zeros(())
+    else:
+        route_reg_raw = route_reg_raw.float()
     local_num_tokens = num_tokens_float.clone().detach().to(torch.int)
     normalizer = torch.clamp(num_tokens_float.detach().float(), min=1.0)
+    route_reg_loss = (
+        route_reg_raw
+        * args.conceptlm_v21_final_read_concept_gate_reg_weight
+        * normalizer
+    )
+    total_loss = token_loss + aux_loss + route_reg_loss
     total_loss_avg = total_loss.detach() / normalizer
 
     report = {
@@ -422,6 +469,10 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: ConceptLMV21Output, model=
         ),
         "conceptlm_v21 aux loss effective": torch.cat(
             [aux_loss.detach().view(1), num_tokens_float.detach().view(1)]
+        ),
+        "conceptlm_v21 route reg loss raw": route_reg_raw.detach().view(1),
+        "conceptlm_v21 route reg loss effective": torch.cat(
+            [route_reg_loss.detach().view(1), num_tokens_float.detach().view(1)]
         ),
     }
     for name, value in output_tensor.concept_metrics.items():

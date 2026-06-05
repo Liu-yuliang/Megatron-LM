@@ -38,6 +38,7 @@ from megatron.core.models.gpt.conceptlm_v2 import (
 )
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.typed_torch import apply_module
+from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
 from megatron.core.utils import make_viewless_tensor
 
 
@@ -58,6 +59,108 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return value.strip().lower() in ("1", "true", "yes", "y", "on")
 
 
+def _legacy_scalar_route_load_enabled(metadata: Optional[dict] = None) -> bool:
+    if metadata is not None and metadata.get("conceptlm_v21_legacy_scalar_route_load"):
+        return True
+    return _env_flag("CONCEPTLM_V21_LEGACY_SCALAR_ROUTE_LOAD")
+
+
+def _force_scalar_routes_enabled(metadata: Optional[dict] = None) -> bool:
+    if metadata is not None and metadata.get("conceptlm_v21_force_scalar_routes"):
+        return True
+    return _env_flag("CONCEPTLM_V21_FORCE_SCALAR_ROUTES")
+
+
+def _diag_route_proj_enabled(metadata: Optional[dict] = None) -> bool:
+    if metadata is not None and metadata.get("conceptlm_v21_diag_route_proj"):
+        return True
+    return _env_flag("CONCEPTLM_V21_DIAG_ROUTE_PROJ")
+
+
+def _active_only_routes_enabled(metadata: Optional[dict] = None) -> bool:
+    if metadata is not None and metadata.get("conceptlm_v21_active_only_routes"):
+        return True
+    return _env_flag("CONCEPTLM_V21_ACTIVE_ONLY_ROUTES")
+
+
+def _v21_layer_key(layer_idx: int) -> str:
+    return str(int(layer_idx))
+
+
+def _v21_every_n_layer_indices(num_layers: int, every_n_layers: int) -> list[int]:
+    every = max(1, int(every_n_layers))
+    return [idx for idx in range(int(num_layers)) if (idx + 1) % every == 0]
+
+
+def _v21_first_n_layer_indices(num_layers: int, first_n: int) -> list[int]:
+    if int(first_n) < 0:
+        return list(range(int(num_layers)))
+    limit = min(max(0, int(first_n)), int(num_layers))
+    return list(range(limit))
+
+
+def _v21_get_layer_module(
+    modules: Optional[nn.Module], layer_idx: int
+) -> Optional[nn.Module]:
+    if modules is None:
+        return None
+    if isinstance(modules, nn.ModuleDict):
+        key = _v21_layer_key(layer_idx)
+        return modules[key] if key in modules else None
+    if isinstance(modules, nn.ModuleList):
+        if 0 <= int(layer_idx) < len(modules):
+            return modules[int(layer_idx)]
+        return None
+    raise TypeError(f"unsupported layer module container: {type(modules)!r}")
+
+
+def _v21_iter_layer_modules(modules: Optional[nn.Module]):
+    if modules is None:
+        return ()
+    if isinstance(modules, nn.ModuleDict):
+        return modules.values()
+    if isinstance(modules, nn.ModuleList):
+        return modules
+    raise TypeError(f"unsupported layer module container: {type(modules)!r}")
+
+
+def _scalar_route_placeholder(weight: Tensor) -> Tensor:
+    return weight.detach().new_empty(())
+
+
+def _diag_from_route_weight(weight: Tensor) -> Tensor:
+    if weight.ndim >= 2:
+        return weight.detach().diagonal().contiguous()
+    return weight.detach().reshape(-1)
+
+
+def _scalar_from_route_weight(weight: Tensor) -> Tensor:
+    if weight.ndim >= 2:
+        return weight.detach().diagonal().mean().reshape(())
+    return weight.detach().reshape(-1)[0].reshape(())
+
+
+def _replace_sharded_tensor_with_scalar_placeholder(
+    sharded_state_dict: Dict[str, Any],
+    old_key: str,
+    new_key: str,
+) -> None:
+    sharded_tensor = sharded_state_dict.pop(old_key, None)
+    if sharded_tensor is None:
+        return
+    if new_key in sharded_state_dict:
+        return
+    tensor = getattr(sharded_tensor, "data", None)
+    if not isinstance(tensor, Tensor):
+        return
+    sharded_state_dict.update(
+        make_sharded_tensors_for_checkpoint(
+            {new_key: _scalar_route_placeholder(tensor)},
+            "",
+        )
+    )
+
+
 def _env_str(name: str, default: str) -> str:
     value = os.environ.get(name)
     if value is None or value.strip() == "":
@@ -73,6 +176,37 @@ def _env_int(name: str, default: int) -> int:
         return int(value.strip())
     except ValueError:
         return default
+
+
+def _v21_route_first_plus_last_n() -> int:
+    return max(0, _env_int("CONCEPTLM_V21_ROUTE_FIRST_PLUS_LAST_N", 0))
+
+
+def _v21_route_keep_indices(num_sources: int, device: Optional[torch.device] = None) -> Optional[Tensor]:
+    recent = _v21_route_first_plus_last_n()
+    if recent <= 0 or num_sources <= recent + 1:
+        return None
+    keep = [0]
+    start = max(1, num_sources - recent)
+    keep.extend(range(start, num_sources))
+    return torch.tensor(keep, dtype=torch.long, device=device)
+
+
+def _v21_route_select_sources(
+    states: Tensor,
+    source_dim: int,
+) -> tuple[Tensor, Optional[Tensor]]:
+    indices = _v21_route_keep_indices(states.shape[source_dim], states.device)
+    if indices is None:
+        return states, None
+    return states.index_select(source_dim, indices), indices
+
+
+def _v21_route_select_sequence(items: list[Any] | tuple[Any, ...]) -> list[Any]:
+    indices = _v21_route_keep_indices(len(items))
+    if indices is None:
+        return list(items)
+    return [items[int(i)] for i in indices.tolist()]
 
 
 def _env_float(name: str, default: float) -> float:
@@ -389,6 +523,21 @@ def _v21_trace_tensor(tag: str, tensor: Optional[Tensor], *, force: bool = False
                 )
 
 
+def _v21_add_zero_param_dependency(hidden: Tensor, module: nn.Module) -> Tensor:
+    if not torch.is_grad_enabled() or not module.training:
+        return hidden
+    dummy = hidden.new_zeros((), dtype=torch.float32)
+    has_param = False
+    for parameter in module.parameters():
+        if not parameter.requires_grad:
+            continue
+        has_param = True
+        dummy = dummy + parameter.reshape(-1)[0].float() * 0.0
+    if not has_param:
+        return hidden
+    return hidden + dummy.to(dtype=hidden.dtype)
+
+
 def _maybe_print_v21_ce_debug(
     hidden_states: Tensor,
     logits: Tensor,
@@ -502,7 +651,18 @@ def _maybe_print_v21_ce_debug(
 
 
 _V21_DEPTH_DD_COMPILED_CACHE: Dict[tuple[int, bool], Callable] = {}
+_V21_DEPTH_DD_UNSTACKED_COMPILED_CACHE: Dict[tuple[int, bool], Callable] = {}
 _V21_DECODER_DD_FINAL_CONCEPT_COMPILED_CACHE: Dict[tuple[int, bool], Callable] = {}
+_V21_DECODER_DD_FINAL_CONCEPT_DIAG_COMPILED_CACHE: Dict[tuple[int, bool], Callable] = {}
+_V21_DECODER_DD_FINAL_CONCEPT_GATE_COMPILED_CACHE: Dict[
+    tuple[int, bool, bool, int, float], Callable
+] = {}
+_V21_DECODER_DD_FINAL_CONCEPT_GATE_DIAG_COMPILED_CACHE: Dict[
+    tuple[int, bool, bool, int, float], Callable
+] = {}
+_V21_DECODER_DD_FINAL_CONCEPT_GATE_UNSTACKED_COMPILED_CACHE: Dict[
+    tuple[int, bool, bool, int, float], Callable
+] = {}
 
 
 def _get_compiled_v21_depth_dd(num_prev: int, use_softmax: bool) -> Callable:
@@ -539,6 +699,42 @@ def _v21_depth_dd_{num_prev}_{suffix}(
     return compiled
 
 
+def _get_compiled_v21_depth_dd_unstacked(num_prev: int, use_softmax: bool) -> Callable:
+    num_prev = int(num_prev)
+    use_softmax = bool(use_softmax)
+    cache_key = (num_prev, use_softmax)
+    compiled = _V21_DEPTH_DD_UNSTACKED_COMPILED_CACHE.get(cache_key)
+    if compiled is not None:
+        return compiled
+
+    namespace = {"F": F}
+    softmax_line = "    weights = weights.softmax(dim=-1)\n" if use_softmax else ""
+    suffix = "softmax" if use_softmax else "linear"
+    history_args = ",\n    ".join(f"h{i}" for i in range(num_prev))
+    weighted_terms = " + ".join(
+        f"h{i} * weights[:, :, {i}:{i + 1}]" for i in range(num_prev)
+    )
+    exec(
+        f"""
+def _v21_depth_dd_unstacked_{num_prev}_{suffix}(
+    current_hidden,
+    w1_weight,
+    w2_weight,
+    static_a,
+    {history_args},
+):
+    weights = F.linear(F.gelu(F.linear(current_hidden, w1_weight)), w2_weight)
+    weights = weights + static_a.view(1, 1, {num_prev})
+{softmax_line.rstrip()}
+    return {weighted_terms}
+        """,
+        namespace,
+    )
+    compiled = _compile_v21(namespace[f"_v21_depth_dd_unstacked_{num_prev}_{suffix}"])
+    _V21_DEPTH_DD_UNSTACKED_COMPILED_CACHE[cache_key] = compiled
+    return compiled
+
+
 def _get_compiled_v21_decoder_dd_final_concept(num_prev: int, use_softmax: bool) -> Callable:
     num_prev = int(num_prev)
     use_softmax = bool(use_softmax)
@@ -572,6 +768,243 @@ def _v21_decoder_dd_final_concept_{num_prev}_{suffix}(
 	    )
     compiled = _compile_v21(namespace[f"_v21_decoder_dd_final_concept_{num_prev}_{suffix}"])
     _V21_DECODER_DD_FINAL_CONCEPT_COMPILED_CACHE[cache_key] = compiled
+    return compiled
+
+
+def _get_compiled_v21_decoder_dd_final_concept_diag(
+    num_prev: int,
+    use_softmax: bool,
+) -> Callable:
+    num_prev = int(num_prev)
+    use_softmax = bool(use_softmax)
+    cache_key = (num_prev, use_softmax)
+    compiled = _V21_DECODER_DD_FINAL_CONCEPT_DIAG_COMPILED_CACHE.get(cache_key)
+    if compiled is not None:
+        return compiled
+
+    namespace = {"F": F, "torch": torch}
+    softmax_line = "    weights = weights.softmax(dim=-1)\n" if use_softmax else ""
+    suffix = "softmax" if use_softmax else "linear"
+    exec(
+        f"""
+def _v21_decoder_dd_final_concept_diag_{num_prev}_{suffix}(
+    history_states,
+    current_hidden,
+    w1_weight,
+    w2_weight,
+    static_a,
+    final_concept_state,
+    final_diag,
+):
+    weights = F.linear(F.gelu(F.linear(current_hidden, w1_weight)), w2_weight)
+    weights = weights + static_a.view(1, 1, {num_prev})
+{softmax_line.rstrip()}
+    hidden = torch.einsum("sbm,sbmh->sbh", weights, history_states)
+    final_update = final_concept_state * final_diag.to(
+        dtype=final_concept_state.dtype,
+        device=final_concept_state.device,
+    )
+    return hidden + final_update.to(dtype=hidden.dtype)
+        """,
+        namespace,
+    )
+    compiled = _compile_v21(namespace[f"_v21_decoder_dd_final_concept_diag_{num_prev}_{suffix}"])
+    _V21_DECODER_DD_FINAL_CONCEPT_DIAG_COMPILED_CACHE[cache_key] = compiled
+    return compiled
+
+
+def _get_compiled_v21_decoder_dd_final_concept_gate(
+    num_prev: int,
+    use_softmax: bool,
+    use_concept_norm: bool,
+    hidden_size: int,
+    norm_eps: float,
+) -> Callable:
+    num_prev = int(num_prev)
+    use_softmax = bool(use_softmax)
+    use_concept_norm = bool(use_concept_norm)
+    hidden_size = int(hidden_size)
+    norm_eps = float(norm_eps)
+    cache_key = (num_prev, use_softmax, use_concept_norm, hidden_size, norm_eps)
+    compiled = _V21_DECODER_DD_FINAL_CONCEPT_GATE_COMPILED_CACHE.get(cache_key)
+    if compiled is not None:
+        return compiled
+
+    namespace = {"F": F, "torch": torch}
+    softmax_line = "    weights = weights.softmax(dim=-1)\n" if use_softmax else ""
+    suffix = "softmax" if use_softmax else "linear"
+    norm_line = (
+        f"    final_concept = F.layer_norm(final_concept_state, ({hidden_size},), "
+        f"concept_norm_weight, concept_norm_bias, {norm_eps!r})\n"
+        if use_concept_norm
+        else "    final_concept = final_concept_state\n"
+    )
+    norm_suffix = "ln" if use_concept_norm else "identity"
+    exec(
+        f"""
+def _v21_decoder_dd_final_concept_gate_{num_prev}_{suffix}_{norm_suffix}(
+    history_states,
+    current_hidden,
+    w1_weight,
+    w2_weight,
+    static_a,
+    final_concept_state,
+    final_proj_weight,
+    final_concept_scale,
+    concept_norm_weight,
+    concept_norm_bias,
+):
+    weights = F.linear(F.gelu(F.linear(current_hidden, w1_weight)), w2_weight)
+    weights = weights + static_a.view(1, 1, {num_prev})
+{softmax_line.rstrip()}
+    hidden = torch.einsum("sbm,sbmh->sbh", weights, history_states)
+{norm_line.rstrip()}
+    final_update = F.linear(final_concept, final_proj_weight.to(dtype=final_concept.dtype))
+    final_update = final_update * final_concept_scale.to(
+        dtype=final_update.dtype,
+        device=final_update.device,
+    )
+    return hidden + final_update.to(dtype=hidden.dtype)
+        """,
+        namespace,
+    )
+    compiled = _compile_v21(
+        namespace[f"_v21_decoder_dd_final_concept_gate_{num_prev}_{suffix}_{norm_suffix}"]
+    )
+    _V21_DECODER_DD_FINAL_CONCEPT_GATE_COMPILED_CACHE[cache_key] = compiled
+    return compiled
+
+
+def _get_compiled_v21_decoder_dd_final_concept_gate_diag(
+    num_prev: int,
+    use_softmax: bool,
+    use_concept_norm: bool,
+    hidden_size: int,
+    norm_eps: float,
+) -> Callable:
+    num_prev = int(num_prev)
+    use_softmax = bool(use_softmax)
+    use_concept_norm = bool(use_concept_norm)
+    hidden_size = int(hidden_size)
+    norm_eps = float(norm_eps)
+    cache_key = (num_prev, use_softmax, use_concept_norm, hidden_size, norm_eps)
+    compiled = _V21_DECODER_DD_FINAL_CONCEPT_GATE_DIAG_COMPILED_CACHE.get(cache_key)
+    if compiled is not None:
+        return compiled
+
+    namespace = {"F": F, "torch": torch}
+    softmax_line = "    weights = weights.softmax(dim=-1)\n" if use_softmax else ""
+    suffix = "softmax" if use_softmax else "linear"
+    norm_line = (
+        f"    final_concept = F.layer_norm(final_concept_state, ({hidden_size},), "
+        f"concept_norm_weight, concept_norm_bias, {norm_eps!r})\n"
+        if use_concept_norm
+        else "    final_concept = final_concept_state\n"
+    )
+    norm_suffix = "ln" if use_concept_norm else "identity"
+    exec(
+        f"""
+def _v21_decoder_dd_final_concept_gate_diag_{num_prev}_{suffix}_{norm_suffix}(
+    history_states,
+    current_hidden,
+    w1_weight,
+    w2_weight,
+    static_a,
+    final_concept_state,
+    final_diag,
+    final_concept_scale,
+    concept_norm_weight,
+    concept_norm_bias,
+):
+    weights = F.linear(F.gelu(F.linear(current_hidden, w1_weight)), w2_weight)
+    weights = weights + static_a.view(1, 1, {num_prev})
+{softmax_line.rstrip()}
+    hidden = torch.einsum("sbm,sbmh->sbh", weights, history_states)
+{norm_line.rstrip()}
+    final_update = final_concept * final_diag.to(
+        dtype=final_concept.dtype,
+        device=final_concept.device,
+    )
+    final_update = final_update * final_concept_scale.to(
+        dtype=final_update.dtype,
+        device=final_update.device,
+    )
+    return hidden + final_update.to(dtype=hidden.dtype)
+        """,
+        namespace,
+    )
+    compiled = _compile_v21(
+        namespace[f"_v21_decoder_dd_final_concept_gate_diag_{num_prev}_{suffix}_{norm_suffix}"]
+    )
+    _V21_DECODER_DD_FINAL_CONCEPT_GATE_DIAG_COMPILED_CACHE[cache_key] = compiled
+    return compiled
+
+
+def _get_compiled_v21_decoder_dd_final_concept_gate_unstacked(
+    num_prev: int,
+    use_softmax: bool,
+    use_concept_norm: bool,
+    hidden_size: int,
+    norm_eps: float,
+) -> Callable:
+    num_prev = int(num_prev)
+    use_softmax = bool(use_softmax)
+    use_concept_norm = bool(use_concept_norm)
+    hidden_size = int(hidden_size)
+    norm_eps = float(norm_eps)
+    cache_key = (num_prev, use_softmax, use_concept_norm, hidden_size, norm_eps)
+    compiled = _V21_DECODER_DD_FINAL_CONCEPT_GATE_UNSTACKED_COMPILED_CACHE.get(cache_key)
+    if compiled is not None:
+        return compiled
+
+    namespace = {"F": F}
+    softmax_line = "    weights = weights.softmax(dim=-1)\n" if use_softmax else ""
+    suffix = "softmax" if use_softmax else "linear"
+    history_args = ",\n    ".join(f"h{i}" for i in range(num_prev))
+    weighted_terms = " + ".join(
+        f"h{i} * weights[:, :, {i}:{i + 1}]" for i in range(num_prev)
+    )
+    norm_line = (
+        f"    final_concept = F.layer_norm(final_concept_state, ({hidden_size},), "
+        f"concept_norm_weight, concept_norm_bias, {norm_eps!r})\n"
+        if use_concept_norm
+        else "    final_concept = final_concept_state\n"
+    )
+    norm_suffix = "ln" if use_concept_norm else "identity"
+    exec(
+        f"""
+def _v21_decoder_dd_final_concept_gate_unstacked_{num_prev}_{suffix}_{norm_suffix}(
+    current_hidden,
+    w1_weight,
+    w2_weight,
+    static_a,
+    final_concept_state,
+    final_proj_weight,
+    final_concept_scale,
+    concept_norm_weight,
+    concept_norm_bias,
+    {history_args},
+):
+    weights = F.linear(F.gelu(F.linear(current_hidden, w1_weight)), w2_weight)
+    weights = weights + static_a.view(1, 1, {num_prev})
+{softmax_line.rstrip()}
+    hidden = {weighted_terms}
+{norm_line.rstrip()}
+    final_update = F.linear(final_concept, final_proj_weight.to(dtype=final_concept.dtype))
+    final_update = final_update * final_concept_scale.to(
+        dtype=final_update.dtype,
+        device=final_update.device,
+    )
+    return hidden + final_update.to(dtype=hidden.dtype)
+        """,
+        namespace,
+    )
+    compiled = _compile_v21(
+        namespace[
+            f"_v21_decoder_dd_final_concept_gate_unstacked_{num_prev}_{suffix}_{norm_suffix}"
+        ]
+    )
+    _V21_DECODER_DD_FINAL_CONCEPT_GATE_UNSTACKED_COMPILED_CACHE[cache_key] = compiled
     return compiled
 
 
@@ -619,9 +1052,10 @@ class V21DepthDD(nn.Module):
             self.static_a[-1] = 1.0
 
     def forward(self, history_states: Tensor, current_hidden: Tensor) -> Tensor:
+        history_states, keep_indices = _v21_route_select_sources(history_states, 2)
         active_prev = history_states.shape[2]
         normed_history = self.history_norm(history_states)
-        if self.compile_dd:
+        if self.compile_dd and keep_indices is None:
             if active_prev != self.num_prev:
                 raise RuntimeError(
                     f"compiled V21DepthDD expects {self.num_prev} history states, "
@@ -635,13 +1069,39 @@ class V21DepthDD(nn.Module):
                 self.static_a,
             )
         weights = self.w2(self.act(self.w1(current_hidden)))
-        weights = weights[:, :, -active_prev:]
-        weights = weights + self.static_a[-active_prev:].view(1, 1, active_prev)
+        if keep_indices is not None:
+            weights = weights.index_select(-1, keep_indices)
+            static_a = self.static_a.index_select(0, keep_indices)
+        else:
+            weights = weights[:, :, -active_prev:]
+            static_a = self.static_a[-active_prev:]
+        weights = weights + static_a.view(1, 1, active_prev)
         if self.use_softmax:
             weights = weights.softmax(dim=-1)
         _v21_trace_tensor(f"depth_dd.layer{self.layer_idx}.weights", weights)
         _v21_trace_tensor(f"depth_dd.layer{self.layer_idx}.history", normed_history)
         return (weights.unsqueeze(-1) * normed_history).sum(dim=2)
+
+    def forward_unstacked(self, current_hidden: Tensor, history_states: list[Tensor]) -> Tensor:
+        keep_indices = _v21_route_keep_indices(len(history_states), current_hidden.device)
+        if keep_indices is not None:
+            history_states = [history_states[int(i)] for i in keep_indices.tolist()]
+        if keep_indices is None and len(history_states) != self.num_prev:
+            raise RuntimeError(
+                f"unstacked V21DepthDD expects {self.num_prev} history states, "
+                f"got {len(history_states)}"
+            )
+        if not self.compile_dd or keep_indices is not None:
+            return self(torch.stack(history_states, dim=2), current_hidden)
+        if not isinstance(self.history_norm, nn.Identity):
+            return self(torch.stack(history_states, dim=2), current_hidden)
+        return _get_compiled_v21_depth_dd_unstacked(self.num_prev, self.use_softmax)(
+            current_hidden,
+            self.w1.weight,
+            self.w2.weight,
+            self.static_a,
+            *history_states,
+        )
 
 
 class V21SelfDD(nn.Module):
@@ -660,25 +1120,60 @@ class V21SelfDD(nn.Module):
     ) -> None:
         super().__init__()
         self.every_n_layers = max(1, int(every_n_layers))
-        self.depth_dds = nn.ModuleList(
-            [
-                V21DepthDD(
-                    hidden_size=hidden_size,
-                    eps=eps,
-                    layer_idx=layer_idx,
-                    route_hidden_size=route_hidden_size,
-                    use_layernorm=use_layernorm,
-                    use_softmax=use_softmax,
-                    compile_dd=compile_dd,
-                )
-                for layer_idx in range(int(num_layers))
-            ]
+        self.active_only_routes = _active_only_routes_enabled()
+
+        def make_depth_dd(layer_idx: int) -> V21DepthDD:
+            return V21DepthDD(
+                hidden_size=hidden_size,
+                eps=eps,
+                layer_idx=layer_idx,
+                route_hidden_size=route_hidden_size,
+                use_layernorm=use_layernorm,
+                use_softmax=use_softmax,
+                compile_dd=compile_dd,
+            )
+
+        if self.active_only_routes:
+            self.depth_dds = nn.ModuleDict(
+                {
+                    _v21_layer_key(layer_idx): make_depth_dd(layer_idx)
+                    for layer_idx in _v21_every_n_layer_indices(
+                        num_layers, self.every_n_layers
+                    )
+                }
+            )
+        else:
+            self.depth_dds = nn.ModuleList(
+                [
+                    make_depth_dd(layer_idx)
+                    for layer_idx in range(int(num_layers))
+                ]
+            )
+
+    def needs_history(self, layer_idx: int) -> bool:
+        return _v21_get_layer_module(self.depth_dds, layer_idx) is not None and (
+            (int(layer_idx) + 1) % self.every_n_layers == 0
         )
 
-    def forward(self, layer_idx: int, current_hidden: Tensor, history_states: Tensor) -> Tensor:
+    def forward(
+        self,
+        layer_idx: int,
+        current_hidden: Tensor,
+        history_states: Optional[Tensor],
+    ) -> Tensor:
         if (layer_idx + 1) % self.every_n_layers != 0:
+            if self.active_only_routes:
+                return current_hidden
+            return _v21_add_zero_param_dependency(
+                current_hidden,
+                self.depth_dds[layer_idx],
+            )
+        depth_dd = _v21_get_layer_module(self.depth_dds, layer_idx)
+        if depth_dd is None:
             return current_hidden
-        return self.depth_dds[layer_idx](history_states, current_hidden)
+        if history_states is None:
+            raise RuntimeError("V21SelfDD active layer requires history_states")
+        return depth_dd(history_states, current_hidden)
 
 
 @_compile_v21
@@ -696,6 +1191,76 @@ def _compiled_v21_residual_route_add(
     weights = route_logits.softmax(dim=-1) if use_softmax else route_logits
     source_mix = torch.einsum("sbm,sbmh->sbh", weights, source_states)
     residual_update = F.linear(source_mix, residual_weight.to(dtype=source_mix.dtype))
+    return target_hidden + residual_update.to(dtype=target_hidden.dtype)
+
+
+@_compile_v21
+def _compiled_v21_residual_route_add_scaled(
+    target_hidden: Tensor,
+    source_states: Tensor,
+    w1_weight: Tensor,
+    w2_weight: Tensor,
+    residual_weight: Tensor,
+    residual_scale: Tensor,
+    use_softmax: bool,
+) -> Tensor:
+    active_sources = source_states.shape[2]
+    route_logits = F.linear(F.gelu(F.linear(target_hidden, w1_weight)), w2_weight)
+    route_logits = route_logits[:, :, -active_sources:]
+    weights = route_logits.softmax(dim=-1) if use_softmax else route_logits
+    source_mix = torch.einsum("sbm,sbmh->sbh", weights, source_states)
+    residual_update = F.linear(source_mix, residual_weight.to(dtype=source_mix.dtype))
+    residual_update = residual_update * residual_scale.to(
+        dtype=residual_update.dtype,
+        device=residual_update.device,
+    )
+    return target_hidden + residual_update.to(dtype=target_hidden.dtype)
+
+
+@_compile_v21
+def _compiled_v21_residual_route_add_diag(
+    target_hidden: Tensor,
+    source_states: Tensor,
+    w1_weight: Tensor,
+    w2_weight: Tensor,
+    residual_diag: Tensor,
+    use_softmax: bool,
+) -> Tensor:
+    active_sources = source_states.shape[2]
+    route_logits = F.linear(F.gelu(F.linear(target_hidden, w1_weight)), w2_weight)
+    route_logits = route_logits[:, :, -active_sources:]
+    weights = route_logits.softmax(dim=-1) if use_softmax else route_logits
+    source_mix = torch.einsum("sbm,sbmh->sbh", weights, source_states)
+    residual_update = source_mix * residual_diag.to(
+        dtype=source_mix.dtype,
+        device=source_mix.device,
+    )
+    return target_hidden + residual_update.to(dtype=target_hidden.dtype)
+
+
+@_compile_v21
+def _compiled_v21_residual_route_add_diag_scaled(
+    target_hidden: Tensor,
+    source_states: Tensor,
+    w1_weight: Tensor,
+    w2_weight: Tensor,
+    residual_diag: Tensor,
+    residual_scale: Tensor,
+    use_softmax: bool,
+) -> Tensor:
+    active_sources = source_states.shape[2]
+    route_logits = F.linear(F.gelu(F.linear(target_hidden, w1_weight)), w2_weight)
+    route_logits = route_logits[:, :, -active_sources:]
+    weights = route_logits.softmax(dim=-1) if use_softmax else route_logits
+    source_mix = torch.einsum("sbm,sbmh->sbh", weights, source_states)
+    residual_update = source_mix * residual_diag.to(
+        dtype=source_mix.dtype,
+        device=source_mix.device,
+    )
+    residual_update = residual_update * residual_scale.to(
+        dtype=residual_update.dtype,
+        device=residual_update.device,
+    )
     return target_hidden + residual_update.to(dtype=target_hidden.dtype)
 
 
@@ -748,6 +1313,169 @@ def _compiled_v21_residual_route_add_repeated_chunks(
     return target_hidden + residual_update.to(dtype=target_hidden.dtype)
 
 
+@_compile_v21
+def _compiled_v21_residual_route_add_repeated_chunks_diag(
+    target_hidden: Tensor,
+    chunk_source_states: Tensor,
+    w1_weight: Tensor,
+    w2_weight: Tensor,
+    residual_diag: Tensor,
+    chunk_size: int,
+    shift_feature: bool,
+    use_softmax: bool,
+) -> Tensor:
+    token_len, batch_size, hidden_size = target_hidden.shape
+    num_chunks = chunk_source_states.shape[0]
+    active_sources = chunk_source_states.shape[2]
+    route_logits = F.linear(F.gelu(F.linear(target_hidden, w1_weight)), w2_weight)
+    route_logits = route_logits[:, :, -active_sources:]
+    weights = route_logits.softmax(dim=-1) if use_softmax else route_logits
+
+    left_pad = 1 if shift_feature else 0
+    if left_pad:
+        weights = torch.cat(
+            [weights.new_zeros(left_pad, batch_size, active_sources), weights],
+            dim=0,
+        )
+
+    repeated_len = num_chunks * chunk_size
+    right_pad = repeated_len - weights.shape[0]
+    if right_pad > 0:
+        weights = torch.cat(
+            [weights, weights.new_zeros(right_pad, batch_size, active_sources)],
+            dim=0,
+        )
+    elif right_pad < 0:
+        weights = weights[:repeated_len]
+
+    chunk_weights = weights.reshape(num_chunks, chunk_size, batch_size, active_sources)
+    source_mix = torch.einsum("ckbm,cbmh->ckbh", chunk_weights, chunk_source_states)
+    source_mix = source_mix.reshape(repeated_len, batch_size, hidden_size)
+    if left_pad:
+        source_mix = source_mix[left_pad : left_pad + token_len]
+    else:
+        source_mix = source_mix[:token_len]
+    if source_mix.shape[0] < token_len:
+        pad = source_mix.new_zeros(token_len - source_mix.shape[0], batch_size, hidden_size)
+        source_mix = torch.cat((source_mix, pad), dim=0)
+    residual_update = source_mix * residual_diag.to(
+        dtype=source_mix.dtype,
+        device=source_mix.device,
+    )
+    return target_hidden + residual_update.to(dtype=target_hidden.dtype)
+
+
+@_compile_v21
+def _compiled_v21_residual_route_add_repeated_chunks_diag_scaled(
+    target_hidden: Tensor,
+    chunk_source_states: Tensor,
+    w1_weight: Tensor,
+    w2_weight: Tensor,
+    residual_diag: Tensor,
+    residual_scale: Tensor,
+    chunk_size: int,
+    shift_feature: bool,
+    use_softmax: bool,
+) -> Tensor:
+    token_len, batch_size, hidden_size = target_hidden.shape
+    num_chunks = chunk_source_states.shape[0]
+    active_sources = chunk_source_states.shape[2]
+    route_logits = F.linear(F.gelu(F.linear(target_hidden, w1_weight)), w2_weight)
+    route_logits = route_logits[:, :, -active_sources:]
+    weights = route_logits.softmax(dim=-1) if use_softmax else route_logits
+
+    left_pad = 1 if shift_feature else 0
+    if left_pad:
+        weights = torch.cat(
+            [weights.new_zeros(left_pad, batch_size, active_sources), weights],
+            dim=0,
+        )
+
+    repeated_len = num_chunks * chunk_size
+    right_pad = repeated_len - weights.shape[0]
+    if right_pad > 0:
+        weights = torch.cat(
+            [weights, weights.new_zeros(right_pad, batch_size, active_sources)],
+            dim=0,
+        )
+    elif right_pad < 0:
+        weights = weights[:repeated_len]
+
+    chunk_weights = weights.reshape(num_chunks, chunk_size, batch_size, active_sources)
+    source_mix = torch.einsum("ckbm,cbmh->ckbh", chunk_weights, chunk_source_states)
+    source_mix = source_mix.reshape(repeated_len, batch_size, hidden_size)
+    if left_pad:
+        source_mix = source_mix[left_pad : left_pad + token_len]
+    else:
+        source_mix = source_mix[:token_len]
+    if source_mix.shape[0] < token_len:
+        pad = source_mix.new_zeros(token_len - source_mix.shape[0], batch_size, hidden_size)
+        source_mix = torch.cat((source_mix, pad), dim=0)
+    residual_update = source_mix * residual_diag.to(
+        dtype=source_mix.dtype,
+        device=source_mix.device,
+    )
+    residual_update = residual_update * residual_scale.to(
+        dtype=residual_update.dtype,
+        device=residual_update.device,
+    )
+    return target_hidden + residual_update.to(dtype=target_hidden.dtype)
+
+
+@_compile_v21
+def _compiled_v21_residual_route_add_repeated_chunks_scaled(
+    target_hidden: Tensor,
+    chunk_source_states: Tensor,
+    w1_weight: Tensor,
+    w2_weight: Tensor,
+    residual_weight: Tensor,
+    residual_scale: Tensor,
+    chunk_size: int,
+    shift_feature: bool,
+    use_softmax: bool,
+) -> Tensor:
+    token_len, batch_size, hidden_size = target_hidden.shape
+    num_chunks = chunk_source_states.shape[0]
+    active_sources = chunk_source_states.shape[2]
+    route_logits = F.linear(F.gelu(F.linear(target_hidden, w1_weight)), w2_weight)
+    route_logits = route_logits[:, :, -active_sources:]
+    weights = route_logits.softmax(dim=-1) if use_softmax else route_logits
+
+    left_pad = 1 if shift_feature else 0
+    if left_pad:
+        weights = torch.cat(
+            [weights.new_zeros(left_pad, batch_size, active_sources), weights],
+            dim=0,
+        )
+
+    repeated_len = num_chunks * chunk_size
+    right_pad = repeated_len - weights.shape[0]
+    if right_pad > 0:
+        weights = torch.cat(
+            [weights, weights.new_zeros(right_pad, batch_size, active_sources)],
+            dim=0,
+        )
+    elif right_pad < 0:
+        weights = weights[:repeated_len]
+
+    chunk_weights = weights.reshape(num_chunks, chunk_size, batch_size, active_sources)
+    source_mix = torch.einsum("ckbm,cbmh->ckbh", chunk_weights, chunk_source_states)
+    source_mix = source_mix.reshape(repeated_len, batch_size, hidden_size)
+    if left_pad:
+        source_mix = source_mix[left_pad : left_pad + token_len]
+    else:
+        source_mix = source_mix[:token_len]
+    if source_mix.shape[0] < token_len:
+        pad = source_mix.new_zeros(token_len - source_mix.shape[0], batch_size, hidden_size)
+        source_mix = torch.cat((source_mix, pad), dim=0)
+    residual_update = F.linear(source_mix, residual_weight.to(dtype=source_mix.dtype))
+    residual_update = residual_update * residual_scale.to(
+        dtype=residual_update.dtype,
+        device=residual_update.device,
+    )
+    return target_hidden + residual_update.to(dtype=target_hidden.dtype)
+
+
 class V21ResidualFlowRouteAdd(nn.Module):
     """DD-style additive route over cross-module source states."""
 
@@ -768,18 +1496,38 @@ class V21ResidualFlowRouteAdd(nn.Module):
         hidden = int(route_hidden_size) or max(1, self.num_source_states)
         self.use_softmax = bool(use_softmax)
         self.compile_route = bool(compile_route)
+        self.force_scalar_routes = _force_scalar_routes_enabled()
+        self.diag_route_proj = (not self.force_scalar_routes) and _diag_route_proj_enabled()
         self.source_norm = (
             nn.LayerNorm(self.hidden_size, eps=eps) if source_use_layernorm else nn.Identity()
         )
         self.w1 = nn.Linear(self.hidden_size, hidden, bias=False)
         self.w2 = nn.Linear(hidden, max(1, self.num_source_states), bias=False)
-        self.residual_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
+        self.beta = (
+            nn.Parameter(torch.empty(())) if self.force_scalar_routes else None
+        )
+        self.residual_diag = (
+            nn.Parameter(torch.empty(self.hidden_size)) if self.diag_route_proj else None
+        )
+        self.residual_proj = (
+            None
+            if self.force_scalar_routes or self.diag_route_proj
+            else nn.Linear(self.hidden_size, self.hidden_size, bias=False)
+        )
         self.act = nn.GELU()
         self.reset_parameters(beta_init)
 
     def reset_parameters(self, beta_init: float = 0.02) -> None:
         nn.init.normal_(self.w1.weight, mean=0.0, std=1.0 / math.sqrt(self.hidden_size))
         nn.init.zeros_(self.w2.weight)
+        if self.force_scalar_routes:
+            with torch.no_grad():
+                self.beta.fill_(float(beta_init))
+            return
+        if self.diag_route_proj:
+            with torch.no_grad():
+                self.residual_diag.fill_(float(beta_init))
+            return
         nn.init.eye_(self.residual_proj.weight)
         with torch.no_grad():
             self.residual_proj.weight.mul_(float(beta_init))
@@ -796,6 +1544,51 @@ class V21ResidualFlowRouteAdd(nn.Module):
     ) -> None:
         old_beta_key = prefix + "beta"
         new_weight_key = prefix + "residual_proj.weight"
+        diag_key = prefix + "residual_diag"
+        if self.force_scalar_routes:
+            if old_beta_key not in state_dict and diag_key in state_dict:
+                state_dict[old_beta_key] = _scalar_from_route_weight(
+                    state_dict.pop(diag_key)
+                )
+            elif old_beta_key not in state_dict and new_weight_key in state_dict:
+                state_dict[old_beta_key] = _scalar_from_route_weight(
+                    state_dict.pop(new_weight_key)
+                )
+            elif old_beta_key in state_dict:
+                state_dict.pop(new_weight_key, None)
+                state_dict.pop(diag_key, None)
+            super()._load_from_state_dict(
+                state_dict,
+                prefix,
+                local_metadata,
+                strict,
+                missing_keys,
+                unexpected_keys,
+                error_msgs,
+            )
+            return
+        if self.diag_route_proj:
+            if diag_key not in state_dict and new_weight_key in state_dict:
+                state_dict[diag_key] = _diag_from_route_weight(
+                    state_dict.pop(new_weight_key)
+                )
+            elif diag_key not in state_dict and old_beta_key in state_dict:
+                beta = state_dict.pop(old_beta_key)
+                beta_value = beta.detach().to(dtype=self.residual_diag.dtype).view(-1)[0]
+                state_dict[diag_key] = beta_value.expand(self.hidden_size).clone()
+            elif diag_key in state_dict:
+                state_dict.pop(new_weight_key, None)
+                state_dict.pop(old_beta_key, None)
+            super()._load_from_state_dict(
+                state_dict,
+                prefix,
+                local_metadata,
+                strict,
+                missing_keys,
+                unexpected_keys,
+                error_msgs,
+            )
+            return
         if old_beta_key in state_dict and new_weight_key not in state_dict:
             beta = state_dict.pop(old_beta_key)
             weight = torch.zeros(
@@ -807,6 +1600,8 @@ class V21ResidualFlowRouteAdd(nn.Module):
             beta_value = beta.detach().to(dtype=weight.dtype, device=weight.device).view(-1)[0]
             weight.diagonal().copy_(beta_value.expand(self.hidden_size))
             state_dict[new_weight_key] = weight
+        elif old_beta_key in state_dict:
+            state_dict.pop(old_beta_key)
         super()._load_from_state_dict(
             state_dict,
             prefix,
@@ -817,12 +1612,55 @@ class V21ResidualFlowRouteAdd(nn.Module):
             error_msgs,
         )
 
-    def forward(self, target_hidden: Tensor, source_states: Optional[Tensor], source_is_normed: bool = False) -> Tensor:
+    def sharded_state_dict(
+        self,
+        prefix: str = "",
+        sharded_offsets: tuple = (),
+        metadata: Optional[dict] = None,
+    ) -> Dict[str, Any]:
+        state_dict = self.state_dict(prefix="", keep_vars=True)
+        if (
+            not self.force_scalar_routes
+            and _legacy_scalar_route_load_enabled(metadata)
+        ):
+            old_beta_key = "beta"
+            new_weight_key = "residual_proj.weight"
+            if new_weight_key in state_dict:
+                state_dict[old_beta_key] = _scalar_route_placeholder(state_dict.pop(new_weight_key))
+            elif "residual_diag" in state_dict:
+                state_dict[old_beta_key] = _scalar_route_placeholder(
+                    state_dict.pop("residual_diag")
+                )
+        return make_sharded_tensors_for_checkpoint(state_dict, prefix, sharded_offsets=sharded_offsets)
+
+    def forward(
+        self,
+        target_hidden: Tensor,
+        source_states: Optional[Tensor],
+        source_is_normed: bool = False,
+        residual_scale: Optional[Tensor] = None,
+    ) -> Tensor:
         if source_states is None or source_states.shape[2] == 0:
             return target_hidden
+        source_states, keep_indices = _v21_route_select_sources(source_states, 2)
         active_sources = source_states.shape[2]
         normed_sources = source_states if source_is_normed else self.source_norm(source_states)
-        if self.compile_route:
+        if (
+            self.compile_route
+            and keep_indices is None
+            and not self.force_scalar_routes
+            and not self.diag_route_proj
+        ):
+            if residual_scale is not None:
+                return _compiled_v21_residual_route_add_scaled(
+                    target_hidden,
+                    normed_sources,
+                    self.w1.weight,
+                    self.w2.weight,
+                    self.residual_proj.weight,
+                    residual_scale,
+                    self.use_softmax,
+                )
             return _compiled_v21_residual_route_add(
                 target_hidden,
                 normed_sources,
@@ -831,18 +1669,58 @@ class V21ResidualFlowRouteAdd(nn.Module):
                 self.residual_proj.weight,
                 self.use_softmax,
             )
+        if (
+            self.compile_route
+            and keep_indices is None
+            and not self.force_scalar_routes
+            and self.diag_route_proj
+        ):
+            if residual_scale is not None:
+                return _compiled_v21_residual_route_add_diag_scaled(
+                    target_hidden,
+                    normed_sources,
+                    self.w1.weight,
+                    self.w2.weight,
+                    self.residual_diag,
+                    residual_scale,
+                    self.use_softmax,
+                )
+            return _compiled_v21_residual_route_add_diag(
+                target_hidden,
+                normed_sources,
+                self.w1.weight,
+                self.w2.weight,
+                self.residual_diag,
+                self.use_softmax,
+            )
         route_logits = self.w2(self.act(self.w1(target_hidden)))
-        route_logits = route_logits[:, :, -active_sources:]
+        if keep_indices is not None:
+            route_logits = route_logits.index_select(-1, keep_indices)
+        else:
+            route_logits = route_logits[:, :, -active_sources:]
         _v21_trace_tensor("residual_route.route_logits", route_logits)
         weights = route_logits.softmax(dim=-1) if self.use_softmax else route_logits
         _v21_trace_tensor("residual_route.weights", weights)
         _v21_trace_tensor("residual_route.sources", normed_sources)
         source_mix = torch.einsum("sbm,sbmh->sbh", weights, normed_sources)
         _v21_trace_tensor("residual_route.source_mix", source_mix)
-        residual_update = F.linear(
-            source_mix,
-            self.residual_proj.weight.to(dtype=source_mix.dtype),
-        )
+        if self.force_scalar_routes:
+            residual_update = source_mix * self.beta.to(dtype=source_mix.dtype)
+        elif self.diag_route_proj:
+            residual_update = source_mix * self.residual_diag.to(
+                dtype=source_mix.dtype,
+                device=source_mix.device,
+            )
+        else:
+            residual_update = F.linear(
+                source_mix,
+                self.residual_proj.weight.to(dtype=source_mix.dtype),
+            )
+        if residual_scale is not None:
+            residual_update = residual_update * residual_scale.to(
+                dtype=residual_update.dtype,
+                device=residual_update.device,
+            )
         return target_hidden + residual_update.to(dtype=target_hidden.dtype)
 
     def forward_repeated_chunks(
@@ -852,10 +1730,12 @@ class V21ResidualFlowRouteAdd(nn.Module):
         chunk_size: int,
         shift_feature: bool = False,
         source_is_normed: bool = False,
+        residual_scale: Optional[Tensor] = None,
     ) -> Tensor:
         if chunk_source_states is None or chunk_source_states.shape[2] == 0:
             return target_hidden
 
+        chunk_source_states, keep_indices = _v21_route_select_sources(chunk_source_states, 2)
         token_len, batch_size, hidden_size = target_hidden.shape
         num_chunks = chunk_source_states.shape[0]
         active_sources = chunk_source_states.shape[2]
@@ -865,7 +1745,24 @@ class V21ResidualFlowRouteAdd(nn.Module):
             if source_is_normed
             else self.source_norm(chunk_source_states)
         )
-        if self.compile_route:
+        if (
+            self.compile_route
+            and keep_indices is None
+            and not self.force_scalar_routes
+            and not self.diag_route_proj
+        ):
+            if residual_scale is not None:
+                return _compiled_v21_residual_route_add_repeated_chunks_scaled(
+                    target_hidden,
+                    normed_sources,
+                    self.w1.weight,
+                    self.w2.weight,
+                    self.residual_proj.weight,
+                    residual_scale,
+                    chunk_size,
+                    shift_feature,
+                    self.use_softmax,
+                )
             return _compiled_v21_residual_route_add_repeated_chunks(
                 target_hidden,
                 normed_sources,
@@ -876,8 +1773,39 @@ class V21ResidualFlowRouteAdd(nn.Module):
                 shift_feature,
                 self.use_softmax,
             )
+        if (
+            self.compile_route
+            and keep_indices is None
+            and not self.force_scalar_routes
+            and self.diag_route_proj
+        ):
+            if residual_scale is not None:
+                return _compiled_v21_residual_route_add_repeated_chunks_diag_scaled(
+                    target_hidden,
+                    normed_sources,
+                    self.w1.weight,
+                    self.w2.weight,
+                    self.residual_diag,
+                    residual_scale,
+                    chunk_size,
+                    shift_feature,
+                    self.use_softmax,
+                )
+            return _compiled_v21_residual_route_add_repeated_chunks_diag(
+                target_hidden,
+                normed_sources,
+                self.w1.weight,
+                self.w2.weight,
+                self.residual_diag,
+                chunk_size,
+                shift_feature,
+                self.use_softmax,
+            )
         route_logits = self.w2(self.act(self.w1(target_hidden)))
-        route_logits = route_logits[:, :, -active_sources:]
+        if keep_indices is not None:
+            route_logits = route_logits.index_select(-1, keep_indices)
+        else:
+            route_logits = route_logits[:, :, -active_sources:]
         _v21_trace_tensor("residual_route.repeated.route_logits", route_logits)
         weights = route_logits.softmax(dim=-1) if self.use_softmax else route_logits
         _v21_trace_tensor("residual_route.repeated.weights", weights)
@@ -911,10 +1839,23 @@ class V21ResidualFlowRouteAdd(nn.Module):
             pad = source_mix.new_zeros(token_len - source_mix.shape[0], batch_size, hidden_size)
             source_mix = torch.cat((source_mix, pad), dim=0)
         _v21_trace_tensor("residual_route.repeated.source_mix", source_mix)
-        residual_update = F.linear(
-            source_mix,
-            self.residual_proj.weight.to(dtype=source_mix.dtype),
-        )
+        if self.force_scalar_routes:
+            residual_update = source_mix * self.beta.to(dtype=source_mix.dtype)
+        elif self.diag_route_proj:
+            residual_update = source_mix * self.residual_diag.to(
+                dtype=source_mix.dtype,
+                device=source_mix.device,
+            )
+        else:
+            residual_update = F.linear(
+                source_mix,
+                self.residual_proj.weight.to(dtype=source_mix.dtype),
+            )
+        if residual_scale is not None:
+            residual_update = residual_update * residual_scale.to(
+                dtype=residual_update.dtype,
+                device=residual_update.device,
+            )
         return target_hidden + residual_update.to(dtype=target_hidden.dtype)
 
 
@@ -940,6 +1881,8 @@ class V21ConceptRouteAdd(nn.Module):
         self.enable_final_concept_route = bool(enable_final_concept_route)
         self.use_dynamic_route = self.enable_raw_concept_route and self.num_concept_states > 1
         hidden = int(route_hidden_size) or max(1, self.num_concept_states)
+        self.force_scalar_routes = _force_scalar_routes_enabled()
+        self.diag_route_proj = (not self.force_scalar_routes) and _diag_route_proj_enabled()
         self.concept_norm = nn.LayerNorm(self.hidden_size, eps=eps) if concept_use_layernorm else nn.Identity()
         if self.use_dynamic_route:
             self.w1 = nn.Linear(self.hidden_size, hidden, bias=False)
@@ -947,14 +1890,38 @@ class V21ConceptRouteAdd(nn.Module):
         else:
             self.w1 = None
             self.w2 = None
+        self.raw_beta = (
+            nn.Parameter(torch.empty(()))
+            if self.force_scalar_routes and self.enable_raw_concept_route
+            else None
+        )
+        self.final_beta = (
+            nn.Parameter(torch.empty(()))
+            if self.force_scalar_routes and self.enable_final_concept_route
+            else None
+        )
+        self.raw_diag = (
+            nn.Parameter(torch.empty(self.hidden_size))
+            if self.enable_raw_concept_route and self.diag_route_proj
+            else None
+        )
+        self.final_diag = (
+            nn.Parameter(torch.empty(self.hidden_size))
+            if self.enable_final_concept_route and self.diag_route_proj
+            else None
+        )
         self.raw_proj = (
             nn.Linear(self.hidden_size, self.hidden_size, bias=False)
             if self.enable_raw_concept_route
+            and not self.force_scalar_routes
+            and not self.diag_route_proj
             else None
         )
         self.final_proj = (
             nn.Linear(self.hidden_size, self.hidden_size, bias=False)
             if self.enable_final_concept_route
+            and not self.force_scalar_routes
+            and not self.diag_route_proj
             else None
         )
         self.use_softmax = bool(use_softmax)
@@ -965,6 +1932,20 @@ class V21ConceptRouteAdd(nn.Module):
         if self.use_dynamic_route:
             nn.init.normal_(self.w1.weight, mean=0.0, std=1.0 / math.sqrt(self.hidden_size))
             nn.init.zeros_(self.w2.weight)
+        if self.force_scalar_routes:
+            with torch.no_grad():
+                if self.raw_beta is not None:
+                    self.raw_beta.fill_(float(beta_init))
+                if self.final_beta is not None:
+                    self.final_beta.fill_(float(beta_init))
+            return
+        if self.diag_route_proj:
+            with torch.no_grad():
+                if self.raw_diag is not None:
+                    self.raw_diag.fill_(float(beta_init))
+                if self.final_diag is not None:
+                    self.final_diag.fill_(float(beta_init))
+            return
         for proj in (self.raw_proj, self.final_proj):
             if proj is None:
                 continue
@@ -1001,8 +1982,54 @@ class V21ConceptRouteAdd(nn.Module):
             weight.diagonal().copy_(beta_value.expand(self.hidden_size))
             state_dict[new_key] = weight
 
-        convert_old_beta("raw_beta", self.raw_proj)
-        convert_old_beta("final_beta", self.final_proj)
+        def convert_to_diag(old_name: str, proj_name: str, diag: Optional[nn.Parameter]) -> None:
+            diag_key = prefix + old_name.replace("_beta", "_diag")
+            proj_key = prefix + proj_name
+            old_key = prefix + old_name
+            if diag is None:
+                state_dict.pop(diag_key, None)
+                state_dict.pop(proj_key, None)
+                state_dict.pop(old_key, None)
+                return
+            if diag_key not in state_dict and proj_key in state_dict:
+                state_dict[diag_key] = _diag_from_route_weight(state_dict.pop(proj_key))
+            elif diag_key not in state_dict and old_key in state_dict:
+                beta = state_dict.pop(old_key)
+                beta_value = beta.detach().to(dtype=diag.dtype).view(-1)[0]
+                state_dict[diag_key] = beta_value.expand(self.hidden_size).clone()
+            elif diag_key in state_dict:
+                state_dict.pop(proj_key, None)
+                state_dict.pop(old_key, None)
+
+        if self.force_scalar_routes:
+            for old_name, new_name, diag_name, beta_param in (
+                ("raw_beta", "raw_proj.weight", "raw_diag", self.raw_beta),
+                ("final_beta", "final_proj.weight", "final_diag", self.final_beta),
+            ):
+                old_key = prefix + old_name
+                new_key = prefix + new_name
+                diag_key = prefix + diag_name
+                if beta_param is None:
+                    state_dict.pop(old_key, None)
+                    state_dict.pop(new_key, None)
+                    state_dict.pop(diag_key, None)
+                elif old_key not in state_dict and diag_key in state_dict:
+                    state_dict[old_key] = _scalar_from_route_weight(
+                        state_dict.pop(diag_key)
+                    )
+                elif old_key not in state_dict and new_key in state_dict:
+                    state_dict[old_key] = _scalar_from_route_weight(
+                        state_dict.pop(new_key)
+                    )
+                elif old_key in state_dict and new_key in state_dict:
+                    state_dict.pop(new_key)
+                    state_dict.pop(diag_key, None)
+        elif self.diag_route_proj:
+            convert_to_diag("raw_beta", "raw_proj.weight", self.raw_diag)
+            convert_to_diag("final_beta", "final_proj.weight", self.final_diag)
+        else:
+            convert_old_beta("raw_beta", self.raw_proj)
+            convert_old_beta("final_beta", self.final_proj)
         super()._load_from_state_dict(
             state_dict,
             prefix,
@@ -1013,23 +2040,60 @@ class V21ConceptRouteAdd(nn.Module):
             error_msgs,
         )
 
+    def sharded_state_dict(
+        self,
+        prefix: str = "",
+        sharded_offsets: tuple = (),
+        metadata: Optional[dict] = None,
+    ) -> Dict[str, Any]:
+        state_dict = self.state_dict(prefix="", keep_vars=True)
+        if (
+            not self.force_scalar_routes
+            and _legacy_scalar_route_load_enabled(metadata)
+        ):
+            for old_name, new_name, diag_name in (
+                ("raw_beta", "raw_proj.weight", "raw_diag"),
+                ("final_beta", "final_proj.weight", "final_diag"),
+            ):
+                if new_name in state_dict:
+                    state_dict[old_name] = _scalar_route_placeholder(state_dict.pop(new_name))
+                elif diag_name in state_dict:
+                    state_dict[old_name] = _scalar_route_placeholder(
+                        state_dict.pop(diag_name)
+                    )
+        return make_sharded_tensors_for_checkpoint(state_dict, prefix, sharded_offsets=sharded_offsets)
+
     def forward(
         self,
         decoder_hidden: Tensor,
         raw_concept_states: Optional[Tensor],
         final_concept_state: Optional[Tensor],
+        final_scale: Optional[Tensor] = None,
     ) -> Tensor:
         hidden = decoder_hidden
-        if self.final_proj is not None and final_concept_state is not None:
+        if self.enable_final_concept_route and final_concept_state is not None:
             final_concept = self.concept_norm(final_concept_state.unsqueeze(2))[:, :, 0, :]
             _v21_trace_tensor("concept_route.final_concept", final_concept)
-            final_update = F.linear(
-                final_concept,
-                self.final_proj.weight.to(dtype=final_concept.dtype),
-            )
+            if self.force_scalar_routes:
+                final_update = final_concept * self.final_beta.to(dtype=final_concept.dtype)
+            elif self.diag_route_proj:
+                final_update = final_concept * self.final_diag.to(
+                    dtype=final_concept.dtype,
+                    device=final_concept.device,
+                )
+            else:
+                final_update = F.linear(
+                    final_concept,
+                    self.final_proj.weight.to(dtype=final_concept.dtype),
+                )
+            if final_scale is not None:
+                final_update = final_update * final_scale.to(
+                    dtype=final_update.dtype,
+                    device=final_update.device,
+                )
             hidden = hidden + final_update.to(dtype=hidden.dtype)
 
-        if self.raw_proj is None or raw_concept_states is None:
+        if not self.enable_raw_concept_route or raw_concept_states is None:
             return hidden
 
         active_concepts = raw_concept_states.shape[2]
@@ -1045,10 +2109,18 @@ class V21ConceptRouteAdd(nn.Module):
             _v21_trace_tensor("concept_route.weights", weights)
             concept_mix = torch.einsum("sbc,sbch->sbh", weights, normed_concepts)
         _v21_trace_tensor("concept_route.concept_mix", concept_mix)
-        raw_update = F.linear(
-            concept_mix,
-            self.raw_proj.weight.to(dtype=concept_mix.dtype),
-        )
+        if self.force_scalar_routes:
+            raw_update = concept_mix * self.raw_beta.to(dtype=concept_mix.dtype)
+        elif self.diag_route_proj:
+            raw_update = concept_mix * self.raw_diag.to(
+                dtype=concept_mix.dtype,
+                device=concept_mix.device,
+            )
+        else:
+            raw_update = F.linear(
+                concept_mix,
+                self.raw_proj.weight.to(dtype=concept_mix.dtype),
+            )
         return hidden + raw_update.to(dtype=hidden.dtype)
 
 
@@ -1079,71 +2151,150 @@ class V21DDTwoRouteAdd(nn.Module):
         self.every_n_layers = max(1, int(every_n_layers))
         self.concept_route_first_n = int(concept_route_first_n)
         self.disable_decoder_dd = bool(disable_decoder_dd)
-        self.decoder_dds = nn.ModuleList(
-            [
-                V21DepthDD(
-                    hidden_size=hidden_size,
-                    eps=eps,
-                    layer_idx=layer_idx,
-                    route_hidden_size=decoder_route_hidden_size,
-                    use_layernorm=decoder_use_layernorm,
-                    use_softmax=decoder_use_softmax,
-                    compile_dd=compile_routes,
-                )
-                for layer_idx in range(int(num_layers))
-            ]
+        self.active_only_routes = _active_only_routes_enabled()
+
+        def make_decoder_dd(layer_idx: int) -> V21DepthDD:
+            return V21DepthDD(
+                hidden_size=hidden_size,
+                eps=eps,
+                layer_idx=layer_idx,
+                route_hidden_size=decoder_route_hidden_size,
+                use_layernorm=decoder_use_layernorm,
+                use_softmax=decoder_use_softmax,
+                compile_dd=compile_routes,
+            )
+
+        def make_concept_route() -> V21ConceptRouteAdd:
+            return V21ConceptRouteAdd(
+                hidden_size=hidden_size,
+                eps=eps,
+                num_concept_states=num_concept_states,
+                beta_init=beta_init,
+                route_hidden_size=concept_route_hidden_size,
+                use_softmax=use_softmax,
+                enable_raw_concept_route=enable_raw_concept_route,
+                enable_final_concept_route=enable_final_concept_route,
+                concept_use_layernorm=concept_use_layernorm,
+            )
+
+        if self.active_only_routes:
+            decoder_dd_indices = (
+                []
+                if self.disable_decoder_dd
+                else _v21_every_n_layer_indices(num_layers, self.every_n_layers)
+            )
+            self.decoder_dds = nn.ModuleDict(
+                {
+                    _v21_layer_key(layer_idx): make_decoder_dd(layer_idx)
+                    for layer_idx in decoder_dd_indices
+                }
+            )
+            self.concept_routes = nn.ModuleDict(
+                {
+                    _v21_layer_key(layer_idx): make_concept_route()
+                    for layer_idx in _v21_first_n_layer_indices(
+                        num_layers, self.concept_route_first_n
+                    )
+                }
+            )
+        else:
+            self.decoder_dds = nn.ModuleList(
+                [make_decoder_dd(layer_idx) for layer_idx in range(int(num_layers))]
+            )
+            self.concept_routes = nn.ModuleList(
+                [make_concept_route() for _ in range(int(num_layers))]
+            )
+
+    def get_decoder_dd(self, layer_idx: int) -> Optional[V21DepthDD]:
+        return _v21_get_layer_module(self.decoder_dds, layer_idx)
+
+    def get_concept_route(self, layer_idx: int) -> Optional[V21ConceptRouteAdd]:
+        return _v21_get_layer_module(self.concept_routes, layer_idx)
+
+    def applies_decoder_dd(self, layer_idx: int) -> bool:
+        return (
+            (not self.disable_decoder_dd)
+            and ((int(layer_idx) + 1) % self.every_n_layers == 0)
+            and self.get_decoder_dd(layer_idx) is not None
         )
-        self.concept_routes = nn.ModuleList(
-            [
-                V21ConceptRouteAdd(
-                    hidden_size=hidden_size,
-                    eps=eps,
-                    num_concept_states=num_concept_states,
-                    beta_init=beta_init,
-                    route_hidden_size=concept_route_hidden_size,
-                    use_softmax=use_softmax,
-                    enable_raw_concept_route=enable_raw_concept_route,
-                    enable_final_concept_route=enable_final_concept_route,
-                    concept_use_layernorm=concept_use_layernorm,
-                )
-                for _ in range(int(num_layers))
-            ]
+
+    def applies_concept_route(
+        self,
+        layer_idx: int,
+        concept_states: Optional[Tensor],
+        final_concept_state: Optional[Tensor],
+    ) -> bool:
+        return (
+            self.get_concept_route(layer_idx) is not None
+            and (concept_states is not None or final_concept_state is not None)
+            and (
+                self.concept_route_first_n < 0
+                or int(layer_idx) < self.concept_route_first_n
+            )
         )
 
     def forward(
         self,
         layer_idx: int,
         current_hidden: Tensor,
-        history_states: Tensor,
+        history_states: Optional[Tensor | list[Tensor]],
         concept_states: Optional[Tensor],
         final_concept_state: Optional[Tensor] = None,
+        final_concept_scale: Optional[Tensor] = None,
     ) -> Tensor:
         hidden = current_hidden
-        route = self.concept_routes[layer_idx]
-        apply_dd = (
-            (not self.disable_decoder_dd)
-            and ((layer_idx + 1) % self.every_n_layers == 0)
+        route = self.get_concept_route(layer_idx)
+        depth_dd = self.get_decoder_dd(layer_idx)
+        apply_dd = self.applies_decoder_dd(layer_idx)
+        apply_concept_route = self.applies_concept_route(
+            layer_idx, concept_states, final_concept_state
         )
-        apply_concept_route = (
-            (concept_states is not None or final_concept_state is not None)
-            and (self.concept_route_first_n < 0 or layer_idx < self.concept_route_first_n)
-        )
+        stacked_history = history_states if isinstance(history_states, Tensor) else None
         can_compile_final_route = (
-            route.raw_proj is None
+            route is not None
+            and stacked_history is not None
+            and not route.force_scalar_routes
+            and route.raw_proj is None
             and final_concept_state is not None
             and route.final_proj is not None
+            and final_concept_scale is None
             and isinstance(route.concept_norm, nn.Identity)
+        )
+        can_compile_final_diag_route = (
+            route is not None
+            and stacked_history is not None
+            and not route.force_scalar_routes
+            and route.raw_diag is None
+            and final_concept_state is not None
+            and route.final_diag is not None
+            and final_concept_scale is None
+            and isinstance(route.concept_norm, nn.Identity)
+        )
+        can_compile_final_gate_ln_route = (
+            route is not None
+            and stacked_history is not None
+            and not route.force_scalar_routes
+            and route.raw_proj is None
+            and final_concept_state is not None
+            and route.final_proj is not None
+        )
+        can_compile_final_gate_ln_diag_route = (
+            route is not None
+            and stacked_history is not None
+            and not route.force_scalar_routes
+            and route.raw_diag is None
+            and final_concept_state is not None
+            and route.final_diag is not None
         )
         if (
             apply_dd
             and apply_concept_route
             and can_compile_final_route
         ):
-            depth_dd = self.decoder_dds[layer_idx]
             return _get_compiled_v21_decoder_dd_final_concept(
                 depth_dd.num_prev, depth_dd.use_softmax
             )(
-                depth_dd.history_norm(history_states),
+                depth_dd.history_norm(stacked_history),
                 current_hidden,
                 depth_dd.w1.weight,
                 depth_dd.w2.weight,
@@ -1151,17 +2302,103 @@ class V21DDTwoRouteAdd(nn.Module):
                 final_concept_state,
                 route.final_proj.weight,
             )
+        if apply_dd and apply_concept_route and can_compile_final_diag_route:
+            return _get_compiled_v21_decoder_dd_final_concept_diag(
+                depth_dd.num_prev, depth_dd.use_softmax
+            )(
+                depth_dd.history_norm(stacked_history),
+                current_hidden,
+                depth_dd.w1.weight,
+                depth_dd.w2.weight,
+                depth_dd.static_a,
+                final_concept_state,
+                route.final_diag,
+            )
+        if apply_dd and apply_concept_route and can_compile_final_gate_ln_route:
+            concept_norm_weight = current_hidden.new_ones(current_hidden.shape[-1])
+            concept_norm_bias = current_hidden.new_zeros(current_hidden.shape[-1])
+            concept_norm_eps = 0.0
+            use_concept_norm = not isinstance(route.concept_norm, nn.Identity)
+            if isinstance(route.concept_norm, nn.LayerNorm):
+                concept_norm_weight = route.concept_norm.weight
+                concept_norm_bias = route.concept_norm.bias
+                concept_norm_eps = float(route.concept_norm.eps)
+            return _get_compiled_v21_decoder_dd_final_concept_gate(
+                depth_dd.num_prev,
+                depth_dd.use_softmax,
+                use_concept_norm,
+                current_hidden.shape[-1],
+                concept_norm_eps,
+            )(
+                depth_dd.history_norm(stacked_history),
+                current_hidden,
+                depth_dd.w1.weight,
+                depth_dd.w2.weight,
+                depth_dd.static_a,
+                final_concept_state,
+                route.final_proj.weight,
+                (
+                    final_concept_scale
+                    if final_concept_scale is not None
+                    else current_hidden.new_ones(())
+                ),
+                concept_norm_weight,
+                concept_norm_bias,
+            )
+        if apply_dd and apply_concept_route and can_compile_final_gate_ln_diag_route:
+            concept_norm_weight = current_hidden.new_ones(current_hidden.shape[-1])
+            concept_norm_bias = current_hidden.new_zeros(current_hidden.shape[-1])
+            concept_norm_eps = 0.0
+            use_concept_norm = not isinstance(route.concept_norm, nn.Identity)
+            if isinstance(route.concept_norm, nn.LayerNorm):
+                concept_norm_weight = route.concept_norm.weight
+                concept_norm_bias = route.concept_norm.bias
+                concept_norm_eps = float(route.concept_norm.eps)
+            return _get_compiled_v21_decoder_dd_final_concept_gate_diag(
+                depth_dd.num_prev,
+                depth_dd.use_softmax,
+                use_concept_norm,
+                current_hidden.shape[-1],
+                concept_norm_eps,
+            )(
+                depth_dd.history_norm(stacked_history),
+                current_hidden,
+                depth_dd.w1.weight,
+                depth_dd.w2.weight,
+                depth_dd.static_a,
+                final_concept_state,
+                route.final_diag,
+                (
+                    final_concept_scale
+                    if final_concept_scale is not None
+                    else current_hidden.new_ones(())
+                ),
+                concept_norm_weight,
+                concept_norm_bias,
+            )
         if apply_dd:
-            hidden = self.decoder_dds[layer_idx](history_states, current_hidden)
+            if depth_dd is None or history_states is None:
+                raise RuntimeError("V21DDTwoRouteAdd active DD layer requires history_states")
+            if isinstance(history_states, list):
+                hidden = depth_dd.forward_unstacked(current_hidden, history_states)
+            else:
+                hidden = depth_dd(history_states, current_hidden)
             _v21_check_finite(f"dd_two_route.layer{layer_idx}.decoder_dd", hidden)
-        elif self.disable_decoder_dd and self.training:
-            dummy = current_hidden.new_zeros(())
-            for parameter in self.decoder_dds[layer_idx].parameters():
-                dummy = dummy + parameter.float().sum() * 0.0
-            hidden = hidden + dummy.to(dtype=hidden.dtype)
+        elif depth_dd is not None:
+            hidden = _v21_add_zero_param_dependency(
+                hidden,
+                depth_dd,
+            )
         if apply_concept_route:
-            hidden = route(hidden, concept_states, final_concept_state)
+            hidden = route(
+                hidden,
+                concept_states,
+                final_concept_state,
+                final_scale=final_concept_scale,
+            )
             _v21_check_finite(f"dd_two_route.layer{layer_idx}.concept_route", hidden)
+        elif route is not None:
+            hidden = _v21_add_zero_param_dependency(hidden, route)
         return hidden
 
 
@@ -1247,6 +2484,7 @@ class ConceptPredictorV21(nn.Module):
         residual_flow_source_use_layernorm: bool = True,
         residual_flow_shared_source_norm: bool = False,
         residual_flow_compile_routes: bool = False,
+        concept_read_encoder_first_n: int = -1,
     ) -> None:
         super().__init__()
         if num_layers <= 0:
@@ -1292,27 +2530,39 @@ class ConceptPredictorV21(nn.Module):
             if use_concept_self_dd
             else None
         )
-        self.concept_read_encoder_routes = (
-            nn.ModuleList(
-                [
-                    V21ResidualFlowRouteAdd(
-                        hidden_size=hidden_size,
-                        eps=eps,
-                        num_source_states=num_concept_read_encoder_sources,
-                        beta_init=residual_flow_beta_init,
-                        route_hidden_size=residual_flow_route_hidden_size,
-                        use_softmax=residual_flow_route_use_softmax,
-                        source_use_layernorm=(
-                            False if residual_flow_shared_source_norm else residual_flow_source_use_layernorm
-                        ),
-                        compile_route=residual_flow_compile_routes,
-                    )
-                    for _ in range(num_layers)
-                ]
+        self.active_only_routes = _active_only_routes_enabled()
+
+        def make_concept_read_encoder_route() -> V21ResidualFlowRouteAdd:
+            return V21ResidualFlowRouteAdd(
+                hidden_size=hidden_size,
+                eps=eps,
+                num_source_states=num_concept_read_encoder_sources,
+                beta_init=residual_flow_beta_init,
+                route_hidden_size=residual_flow_route_hidden_size,
+                use_softmax=residual_flow_route_use_softmax,
+                source_use_layernorm=(
+                    False if residual_flow_shared_source_norm else residual_flow_source_use_layernorm
+                ),
+                compile_route=residual_flow_compile_routes,
             )
-            if enable_concept_read_encoder and num_concept_read_encoder_sources > 0
-            else None
-        )
+
+        self.concept_read_encoder_routes = None
+        if enable_concept_read_encoder and num_concept_read_encoder_sources > 0:
+            if self.active_only_routes:
+                route_indices = _v21_first_n_layer_indices(
+                    num_layers, concept_read_encoder_first_n
+                )
+                if route_indices:
+                    self.concept_read_encoder_routes = nn.ModuleDict(
+                        {
+                            _v21_layer_key(layer_idx): make_concept_read_encoder_route()
+                            for layer_idx in route_indices
+                        }
+                    )
+            else:
+                self.concept_read_encoder_routes = nn.ModuleList(
+                    [make_concept_read_encoder_route() for _ in range(num_layers)]
+                )
         self.concept_read_encoder_shared_source_norm = (
             nn.LayerNorm(hidden_size, eps=eps)
             if self.concept_read_encoder_routes is not None
@@ -1320,6 +2570,7 @@ class ConceptPredictorV21(nn.Module):
             and residual_flow_source_use_layernorm
             else None
         )
+        self.concept_read_encoder_first_n = int(concept_read_encoder_first_n)
 
     def reset_scaled_truncated_parameters(self, hidden_size: int, total_layers: int) -> None:
         for layer in self.layers:
@@ -1348,19 +2599,40 @@ class ConceptPredictorV21(nn.Module):
                 concept_history.append(raw_out)
             if self.concept_self_dd is not None:
                 dd_history.append(raw_out)
+                history_states = (
+                    torch.stack(dd_history, dim=2)
+                    if self.concept_self_dd.needs_history(layer_idx)
+                    else None
+                )
                 layer_out = self.concept_self_dd(
                     layer_idx,
                     layer_out,
-                    torch.stack(dd_history, dim=2),
+                    history_states,
                 )
                 _v21_check_finite(f"concept.layer{layer_idx}.self_dd", layer_out)
-            if self.concept_read_encoder_routes is not None and encoder_concept_states is not None:
-                layer_out = self.concept_read_encoder_routes[layer_idx](
+            concept_read_encoder_route = _v21_get_layer_module(
+                self.concept_read_encoder_routes, layer_idx
+            )
+            apply_concept_read_encoder = (
+                concept_read_encoder_route is not None
+                and encoder_concept_states is not None
+                and (
+                    self.concept_read_encoder_first_n < 0
+                    or layer_idx < self.concept_read_encoder_first_n
+                )
+            )
+            if apply_concept_read_encoder:
+                layer_out = concept_read_encoder_route(
                     layer_out,
                     encoder_concept_states,
                     self.concept_read_encoder_shared_source_norm is not None,
                 )
                 _v21_check_finite(f"concept.layer{layer_idx}.read_encoder", layer_out)
+            elif concept_read_encoder_route is not None:
+                layer_out = _v21_add_zero_param_dependency(
+                    layer_out,
+                    concept_read_encoder_route,
+                )
             hidden_states = layer_out
         hidden_states = self.final_layernorm(hidden_states)
         _v21_check_finite("concept.final_layernorm", hidden_states)
@@ -1428,11 +2700,16 @@ class ConceptLMV21Model(ConceptLMV2Model):
         concept_enable_concept_read_encoder: bool = False,
         concept_enable_decoder_read_encoder: bool = False,
         concept_enable_decoder_read_concept: bool = False,
+        concept_read_encoder_first_n: int = -1,
+        concept_decoder_read_encoder_first_n: int = -1,
         concept_residual_flow_beta_init: float = 0.02,
         concept_residual_flow_route_hidden_size: int = 0,
         concept_residual_flow_route_use_softmax: bool = True,
         concept_residual_flow_source_use_layernorm: bool = True,
         concept_residual_flow_shared_source_norm: bool = False,
+        concept_final_read_concept_gate: bool = False,
+        concept_final_read_concept_gate_init_final: float = 0.5,
+        concept_final_read_concept_gate_target_final: float = 0.5,
         concept_compile_residual_flow_routes: bool = False,
         concept_compile_dd_routes: bool = False,
         **kwargs: Any,
@@ -1478,6 +2755,7 @@ class ConceptLMV21Model(ConceptLMV2Model):
         self.concept_enable_decoder_read_concept = (
             self.concept_enable_full_residual_flow or bool(concept_enable_decoder_read_concept)
         )
+        self.concept_decoder_read_encoder_first_n = int(concept_decoder_read_encoder_first_n)
         self.concept_residual_flow_shared_source_norm = bool(
             concept_residual_flow_shared_source_norm
         )
@@ -1526,6 +2804,7 @@ class ConceptLMV21Model(ConceptLMV2Model):
             residual_flow_source_use_layernorm=concept_residual_flow_source_use_layernorm,
             residual_flow_shared_source_norm=concept_residual_flow_shared_source_norm,
             residual_flow_compile_routes=concept_compile_residual_flow_routes,
+            concept_read_encoder_first_n=concept_read_encoder_first_n,
         )
         if _uses_scaled_truncated_init(self.config):
             self.concept_predictor.reset_scaled_truncated_parameters(
@@ -1576,29 +2855,45 @@ class ConceptLMV21Model(ConceptLMV2Model):
             self.dd_concept_builder = None
             self.dd_two_route_add = None
 
-        self.decoder_read_encoder_routes = (
-            nn.ModuleList(
-                [
-                    V21ResidualFlowRouteAdd(
-                        hidden_size=hidden_size,
-                        eps=eps,
-                        num_source_states=self.concept_encoder_layers,
-                        beta_init=concept_residual_flow_beta_init,
-                        route_hidden_size=concept_residual_flow_route_hidden_size,
-                        use_softmax=concept_residual_flow_route_use_softmax,
-                        source_use_layernorm=(
-                            False
-                            if concept_residual_flow_shared_source_norm
-                            else concept_residual_flow_source_use_layernorm
-                        ),
-                        compile_route=concept_compile_residual_flow_routes,
-                    )
-                    for _ in range(self.concept_decoder_layers)
-                ]
+        self.active_only_routes = _active_only_routes_enabled()
+
+        def make_decoder_read_encoder_route() -> V21ResidualFlowRouteAdd:
+            return V21ResidualFlowRouteAdd(
+                hidden_size=hidden_size,
+                eps=eps,
+                num_source_states=self.concept_encoder_layers,
+                beta_init=concept_residual_flow_beta_init,
+                route_hidden_size=concept_residual_flow_route_hidden_size,
+                use_softmax=concept_residual_flow_route_use_softmax,
+                source_use_layernorm=(
+                    False
+                    if concept_residual_flow_shared_source_norm
+                    else concept_residual_flow_source_use_layernorm
+                ),
+                compile_route=concept_compile_residual_flow_routes,
             )
-            if self.concept_enable_decoder_read_encoder and self.concept_encoder_layers > 0
-            else None
-        )
+
+        self.decoder_read_encoder_routes = None
+        if self.concept_enable_decoder_read_encoder and self.concept_encoder_layers > 0:
+            if self.active_only_routes:
+                route_indices = _v21_first_n_layer_indices(
+                    self.concept_decoder_layers,
+                    self.concept_decoder_read_encoder_first_n,
+                )
+                if route_indices:
+                    self.decoder_read_encoder_routes = nn.ModuleDict(
+                        {
+                            _v21_layer_key(layer_idx): make_decoder_read_encoder_route()
+                            for layer_idx in route_indices
+                        }
+                    )
+            else:
+                self.decoder_read_encoder_routes = nn.ModuleList(
+                    [
+                        make_decoder_read_encoder_route()
+                        for _ in range(self.concept_decoder_layers)
+                    ]
+                )
         self.decoder_read_encoder_shared_source_norm = (
             nn.LayerNorm(hidden_size, eps=eps)
             if self.decoder_read_encoder_routes is not None
@@ -1636,6 +2931,29 @@ class ConceptLMV21Model(ConceptLMV2Model):
             and concept_residual_flow_source_use_layernorm
             else None
         )
+        self.concept_final_read_concept_gate = bool(concept_final_read_concept_gate)
+        self.concept_final_read_concept_gate_target_final = float(
+            concept_final_read_concept_gate_target_final
+        )
+        self.final_read_concept_gate_logits: Optional[nn.Parameter]
+        if (
+            self.concept_final_read_concept_gate
+            and self.dd_two_route_add is not None
+            and self.decoder_read_concept_routes is not None
+        ):
+            init_final = min(
+                max(float(concept_final_read_concept_gate_init_final), 1.0e-4),
+                1.0 - 1.0e-4,
+            )
+            init_weights = torch.tensor(
+                [init_final, 1.0 - init_final],
+                dtype=torch.float32,
+            )
+            self.final_read_concept_gate_logits = nn.Parameter(
+                init_weights.log().repeat(self.concept_decoder_layers, 1)
+            )
+        else:
+            self.final_read_concept_gate_logits = None
         self._v21_decoder_torch_compile_enabled = _env_flag(
             "ENABLE_MUDD_TORCH_COMPILE"
         ) or _env_flag("ENABLE_CONCEPTLM_V21_DECODER_TORCH_COMPILE")
@@ -1739,7 +3057,12 @@ class ConceptLMV21Model(ConceptLMV2Model):
             if self.dd_encoder_self_dd is None:
                 return layer_out
             dd_history.append(raw_out)
-            out = self.dd_encoder_self_dd(layer_idx, layer_out, torch.stack(dd_history, dim=2))
+            history_states = (
+                torch.stack(dd_history, dim=2)
+                if self.dd_encoder_self_dd.needs_history(layer_idx)
+                else None
+            )
+            out = self.dd_encoder_self_dd(layer_idx, layer_out, history_states)
             _v21_check_finite(f"encoder.layer{layer_idx}.self_dd", out)
             return out
 
@@ -1763,7 +3086,8 @@ class ConceptLMV21Model(ConceptLMV2Model):
         routes = getattr(self.concept_predictor, "concept_read_encoder_routes", None)
         if routes is None or len(encoder_raw_layer_states) <= 1:
             return None
-        chunk_states = [self._merge_token_chunks(state)[0] for state in encoder_raw_layer_states[:-1]]
+        source_layer_states = _v21_route_select_sequence(encoder_raw_layer_states[:-1])
+        chunk_states = [self._merge_token_chunks(state)[0] for state in source_layer_states]
         encoder_concept_states = torch.stack(chunk_states, dim=2)
         shared_norm = getattr(self.concept_predictor, "concept_read_encoder_shared_source_norm", None)
         if shared_norm is not None:
@@ -1773,7 +3097,8 @@ class ConceptLMV21Model(ConceptLMV2Model):
     def _build_decoder_encoder_states(self, encoder_raw_layer_states: list[Tensor]) -> Optional[Tensor]:
         if self.decoder_read_encoder_routes is None or len(encoder_raw_layer_states) == 0:
             return None
-        decoder_encoder_states = torch.stack(encoder_raw_layer_states, dim=2)
+        source_layer_states = _v21_route_select_sequence(encoder_raw_layer_states)
+        decoder_encoder_states = torch.stack(source_layer_states, dim=2)
         if self.decoder_read_encoder_shared_source_norm is not None:
             decoder_encoder_states = self.decoder_read_encoder_shared_source_norm(
                 decoder_encoder_states
@@ -1878,7 +3203,7 @@ class ConceptLMV21Model(ConceptLMV2Model):
             return repeated_final_concept_states, None
         layer_stack = None
         if concept_layer_states is not None:
-            layer_stack = torch.stack(concept_layer_states, dim=2)
+            layer_stack = torch.stack(_v21_route_select_sequence(concept_layer_states), dim=2)
         return self.dd_concept_builder(final_concept_chunk_states, layer_stack, seq_len)
 
     def _build_decoder_concept_states(
@@ -1887,7 +3212,7 @@ class ConceptLMV21Model(ConceptLMV2Model):
     ) -> Optional[Tensor]:
         if self.decoder_read_concept_routes is None or concept_layer_states is None:
             return None
-        layer_stack = torch.stack(concept_layer_states, dim=2)
+        layer_stack = torch.stack(_v21_route_select_sequence(concept_layer_states), dim=2)
         zero_chunk = torch.zeros_like(layer_stack[:1])
         decoder_concept_states = torch.cat((zero_chunk, layer_stack), dim=0)
         if self.decoder_read_concept_shared_source_norm is not None:
@@ -1895,6 +3220,30 @@ class ConceptLMV21Model(ConceptLMV2Model):
                 decoder_concept_states
             )
         return decoder_concept_states
+
+    def _final_read_concept_gate_weights(
+        self,
+        layer_idx: int,
+        final_concept_state: Optional[Tensor],
+        decoder_concept_states: Optional[Tensor],
+    ) -> Optional[Tensor]:
+        if self.final_read_concept_gate_logits is None:
+            return None
+        if self.dd_two_route_add is None or self.decoder_read_concept_routes is None:
+            return None
+        if final_concept_state is None or decoder_concept_states is None:
+            return None
+        if (
+            self.dd_two_route_add.concept_route_first_n >= 0
+            and layer_idx >= self.dd_two_route_add.concept_route_first_n
+        ):
+            return None
+        route = self.dd_two_route_add.get_concept_route(layer_idx)
+        if route is None:
+            return None
+        if not route.enable_final_concept_route:
+            return None
+        return self.final_read_concept_gate_logits[layer_idx].float().softmax(dim=-1)
 
     def _run_v21_decoder_compiled(
         self,
@@ -1981,22 +3330,129 @@ class ConceptLMV21Model(ConceptLMV2Model):
             _v21_check_finite(f"decoder.layer{layer_idx}.raw", layer_out)
             hidden = layer_out
             dd_history.append(layer_out)
+            final_read_gate = self._final_read_concept_gate_weights(
+                layer_idx,
+                final_concept_state,
+                decoder_concept_states,
+            )
+            final_concept_scale = None
+            decoder_read_concept_scale = None
+            if final_read_gate is not None:
+                final_concept_scale = final_read_gate[0]
+                decoder_read_concept_scale = final_read_gate[1]
             if self.dd_two_route_add is not None:
-                hidden = self.dd_two_route_add(
-                    layer_idx,
-                    hidden,
-                    torch.stack(dd_history, dim=2),
-                    dd_concept_states,
-                    final_concept_state,
+                apply_decoder_dd = self.dd_two_route_add.applies_decoder_dd(layer_idx)
+                apply_concept_route = self.dd_two_route_add.applies_concept_route(
+                    layer_idx, dd_concept_states, final_concept_state
                 )
-                _v21_check_finite(f"decoder.layer{layer_idx}.dd_two_route_add", hidden)
-            if self.decoder_read_encoder_routes is not None and decoder_encoder_states is not None:
-                hidden = self.decoder_read_encoder_routes[layer_idx](
+                apply_dd_two_route = (
+                    apply_decoder_dd
+                    or apply_concept_route
+                    or not self.dd_two_route_add.active_only_routes
+                )
+                route = (
+                    self.dd_two_route_add.get_concept_route(layer_idx)
+                    if apply_dd_two_route
+                    else None
+                )
+                depth_dd = (
+                    self.dd_two_route_add.get_decoder_dd(layer_idx)
+                    if apply_dd_two_route
+                    else None
+                )
+                if (
+                    apply_dd_two_route
+                    and
+                    self.dd_two_route_add.disable_decoder_dd is False
+                    and self.dd_two_route_add.every_n_layers == 1
+                    and self.dd_two_route_add.concept_route_first_n < 0
+                    and final_concept_state is not None
+                    and dd_concept_states is None
+                    and route is not None
+                    and depth_dd is not None
+                    and not route.enable_raw_concept_route
+                ):
+                    use_fused_final_route = (
+                        not route.force_scalar_routes
+                        and depth_dd.compile_dd
+                        and isinstance(depth_dd.history_norm, nn.Identity)
+                        and route.final_proj is not None
+                    )
+                    if use_fused_final_route:
+                        concept_norm_weight = hidden.new_ones(hidden.shape[-1])
+                        concept_norm_bias = hidden.new_zeros(hidden.shape[-1])
+                        concept_norm_eps = 0.0
+                        use_concept_norm = not isinstance(route.concept_norm, nn.Identity)
+                        if isinstance(route.concept_norm, nn.LayerNorm):
+                            concept_norm_weight = route.concept_norm.weight
+                            concept_norm_bias = route.concept_norm.bias
+                            concept_norm_eps = float(route.concept_norm.eps)
+                        hidden = _get_compiled_v21_decoder_dd_final_concept_gate_unstacked(
+                            depth_dd.num_prev,
+                            depth_dd.use_softmax,
+                            use_concept_norm,
+                            hidden.shape[-1],
+                            concept_norm_eps,
+                        )(
+                            hidden,
+                            depth_dd.w1.weight,
+                            depth_dd.w2.weight,
+                            depth_dd.static_a,
+                            final_concept_state,
+                            route.final_proj.weight,
+                            (
+                                final_concept_scale
+                                if final_concept_scale is not None
+                                else hidden.new_ones(())
+                            ),
+                            concept_norm_weight,
+                            concept_norm_bias,
+                            *dd_history,
+                        )
+                    else:
+                        dd_hidden = depth_dd.forward_unstacked(hidden, dd_history)
+                        _v21_check_finite(f"dd_two_route.layer{layer_idx}.decoder_dd", dd_hidden)
+                        hidden = route(
+                            dd_hidden,
+                            None,
+                            final_concept_state,
+                            final_scale=final_concept_scale,
+                        )
+                    _v21_check_finite(f"dd_two_route.layer{layer_idx}.concept_route", hidden)
+                elif apply_dd_two_route:
+                    hidden = self.dd_two_route_add(
+                        layer_idx,
+                        hidden,
+                        dd_history,
+                        dd_concept_states,
+                        final_concept_state,
+                        final_concept_scale=final_concept_scale,
+                    )
+                if apply_dd_two_route:
+                    _v21_check_finite(f"decoder.layer{layer_idx}.dd_two_route_add", hidden)
+            decoder_read_encoder_route = _v21_get_layer_module(
+                self.decoder_read_encoder_routes, layer_idx
+            )
+            apply_decoder_read_encoder = (
+                decoder_read_encoder_route is not None
+                and decoder_encoder_states is not None
+                and (
+                    self.concept_decoder_read_encoder_first_n < 0
+                    or layer_idx < self.concept_decoder_read_encoder_first_n
+                )
+            )
+            if apply_decoder_read_encoder:
+                hidden = decoder_read_encoder_route(
                     hidden,
                     decoder_encoder_states,
                     self.decoder_read_encoder_shared_source_norm is not None,
                 )
                 _v21_check_finite(f"decoder.layer{layer_idx}.read_encoder", hidden)
+            elif decoder_read_encoder_route is not None:
+                hidden = _v21_add_zero_param_dependency(
+                    hidden,
+                    decoder_read_encoder_route,
+                )
             if self.decoder_read_concept_routes is not None and decoder_concept_states is not None:
                 hidden = self.decoder_read_concept_routes[layer_idx].forward_repeated_chunks(
                     hidden,
@@ -2004,6 +3460,7 @@ class ConceptLMV21Model(ConceptLMV2Model):
                     self.concept_chunk_size,
                     self.concept_shift_feature,
                     self.decoder_read_concept_shared_source_norm is not None,
+                    residual_scale=decoder_read_concept_scale,
                 )
                 _v21_check_finite(f"decoder.layer{layer_idx}.read_concept", hidden)
             return hidden
@@ -2041,8 +3498,15 @@ class ConceptLMV21Model(ConceptLMV2Model):
             final_norm_values = []
             raw_diag_values = []
             raw_norm_values = []
-            for route in self.dd_two_route_add.concept_routes:
-                if route.final_proj is not None:
+            final_beta_values = []
+            raw_beta_values = []
+            for route in _v21_iter_layer_modules(self.dd_two_route_add.concept_routes):
+                if route.force_scalar_routes:
+                    if route.final_beta is not None:
+                        final_beta_values.append(route.final_beta)
+                    if route.raw_beta is not None:
+                        raw_beta_values.append(route.raw_beta)
+                elif route.final_proj is not None:
                     final_diag_values.append(route.final_proj.weight.diagonal().mean())
                     final_norm_values.append(route.final_proj.weight.norm())
                 if route.raw_proj is not None:
@@ -2052,14 +3516,34 @@ class ConceptLMV21Model(ConceptLMV2Model):
             add_mean("conceptlm_v21/dd_final_concept_proj_norm_mean", final_norm_values)
             add_mean("conceptlm_v21/dd_raw_concept_proj_diag_mean", raw_diag_values)
             add_mean("conceptlm_v21/dd_raw_concept_proj_norm_mean", raw_norm_values)
+            add_mean("conceptlm_v21/dd_final_concept_beta_mean", final_beta_values)
+            add_mean("conceptlm_v21/dd_raw_concept_beta_mean", raw_beta_values)
 
-        def collect_resflow(prefix: str, routes: Optional[nn.ModuleList]) -> None:
+        def collect_resflow(prefix: str, routes: Optional[nn.Module]) -> None:
             if routes is None:
                 return
-            diag_values = [route.residual_proj.weight.diagonal().mean() for route in routes]
-            norm_values = [route.residual_proj.weight.norm() for route in routes]
+            route_values = _v21_iter_layer_modules(routes)
+            scalar_values = [
+                route.beta for route in route_values
+                if getattr(route, "force_scalar_routes", False) and route.beta is not None
+            ]
+            route_values = _v21_iter_layer_modules(routes)
+            diag_values = [
+                route.residual_proj.weight.diagonal().mean()
+                for route in route_values
+                if not getattr(route, "force_scalar_routes", False)
+                and route.residual_proj is not None
+            ]
+            route_values = _v21_iter_layer_modules(routes)
+            norm_values = [
+                route.residual_proj.weight.norm()
+                for route in route_values
+                if not getattr(route, "force_scalar_routes", False)
+                and route.residual_proj is not None
+            ]
             add_mean(f"conceptlm_v21/{prefix}_residual_proj_diag_mean", diag_values)
             add_mean(f"conceptlm_v21/{prefix}_residual_proj_norm_mean", norm_values)
+            add_mean(f"conceptlm_v21/{prefix}_beta_mean", scalar_values)
 
         collect_resflow("resflow_decoder_read_encoder", self.decoder_read_encoder_routes)
         collect_resflow("resflow_decoder_read_concept", self.decoder_read_concept_routes)
@@ -2067,7 +3551,53 @@ class ConceptLMV21Model(ConceptLMV2Model):
             "resflow_concept_read_encoder",
             getattr(self.concept_predictor, "concept_read_encoder_routes", None),
         )
+        if self.final_read_concept_gate_logits is not None:
+            weights = self.final_read_concept_gate_logits.float().softmax(dim=-1)
+            metrics["conceptlm_v21/final_read_concept_gate_final_mean"] = weights[:, 0].mean()
+            metrics["conceptlm_v21/final_read_concept_gate_read_concept_mean"] = (
+                weights[:, 1].mean()
+            )
+            target_final = min(
+                max(float(self.concept_final_read_concept_gate_target_final), 0.0),
+                1.0,
+            )
+            target = weights.new_tensor(target_final)
+            metrics["conceptlm_v21/final_read_concept_gate_target_final"] = target
+            metrics["conceptlm_v21/final_read_concept_gate_reg_raw"] = (
+                weights[:, 0] - target
+            ).pow(2).mean()
         return metrics
+
+    def sharded_state_dict(
+        self,
+        prefix: str = "",
+        sharded_offsets: tuple = (),
+        metadata: Optional[dict] = None,
+    ) -> Dict[str, Any]:
+        sharded_state_dict = super().sharded_state_dict(prefix, sharded_offsets, metadata)
+        if not _legacy_scalar_route_load_enabled(metadata):
+            return sharded_state_dict
+
+        for key in list(sharded_state_dict.keys()):
+            if key.endswith(".residual_proj.weight"):
+                _replace_sharded_tensor_with_scalar_placeholder(
+                    sharded_state_dict,
+                    key,
+                    key[: -len("residual_proj.weight")] + "beta",
+                )
+            elif key.endswith(".raw_proj.weight"):
+                _replace_sharded_tensor_with_scalar_placeholder(
+                    sharded_state_dict,
+                    key,
+                    key[: -len("raw_proj.weight")] + "raw_beta",
+                )
+            elif key.endswith(".final_proj.weight"):
+                _replace_sharded_tensor_with_scalar_placeholder(
+                    sharded_state_dict,
+                    key,
+                    key[: -len("final_proj.weight")] + "final_beta",
+                )
+        return sharded_state_dict
 
     def forward(
         self,
