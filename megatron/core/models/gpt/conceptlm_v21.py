@@ -59,6 +59,20 @@ class _V21RouteSourceContext:
     concept_layer_stack: Optional[Tensor] = None
 
 
+@dataclass(frozen=True)
+class _V21DecoderRoutePlan:
+    """Static per-decoder-layer route dispatch data."""
+
+    dd_two_route_force_call: bool = False
+    decoder_dd: Optional[nn.Module] = None
+    concept_route: Optional[nn.Module] = None
+    apply_decoder_dd: bool = False
+    concept_route_layer_enabled: bool = False
+    decoder_read_encoder_route: Optional[nn.Module] = None
+    decoder_read_encoder_layer_enabled: bool = False
+    decoder_read_concept_route: Optional[nn.Module] = None
+
+
 def _env_flag(name: str, default: bool = False) -> bool:
     value = os.environ.get(name)
     if value is None:
@@ -2290,16 +2304,54 @@ class V21DDTwoRouteAdd(nn.Module):
         final_concept_state: Optional[Tensor] = None,
         final_concept_scale: Optional[Tensor] = None,
     ) -> Tensor:
-        hidden = current_hidden
-        route = self.get_concept_route(layer_idx)
         depth_dd = self.get_decoder_dd(layer_idx)
-        apply_dd = self.applies_decoder_dd(layer_idx)
-        apply_concept_route = self.applies_concept_route(
-            layer_idx, concept_states, final_concept_state
+        route = self.get_concept_route(layer_idx)
+        return self.forward_planned(
+            layer_idx,
+            current_hidden,
+            history_states,
+            concept_states,
+            final_concept_state=final_concept_state,
+            final_concept_scale=final_concept_scale,
+            depth_dd=depth_dd,
+            route=route,
+            apply_dd=(
+                (not self.disable_decoder_dd)
+                and ((int(layer_idx) + 1) % self.every_n_layers == 0)
+                and depth_dd is not None
+            ),
+            concept_route_layer_enabled=(
+                route is not None
+                and (
+                    self.concept_route_first_n < 0
+                    or int(layer_idx) < self.concept_route_first_n
+                )
+            ),
+        )
+
+    def forward_planned(
+        self,
+        layer_idx: int,
+        current_hidden: Tensor,
+        history_states: Optional[Tensor | list[Tensor]],
+        concept_states: Optional[Tensor],
+        final_concept_state: Optional[Tensor] = None,
+        final_concept_scale: Optional[Tensor] = None,
+        depth_dd: Optional[V21DepthDD] = None,
+        route: Optional[V21ConceptRouteAdd] = None,
+        apply_dd: bool = False,
+        concept_route_layer_enabled: bool = False,
+    ) -> Tensor:
+        hidden = current_hidden
+        apply_concept_route = (
+            route is not None
+            and bool(concept_route_layer_enabled)
+            and (concept_states is not None or final_concept_state is not None)
         )
         stacked_history = history_states if isinstance(history_states, Tensor) else None
         can_compile_final_route = (
             route is not None
+            and depth_dd is not None
             and stacked_history is not None
             and not route.force_scalar_routes
             and route.raw_proj is None
@@ -2310,6 +2362,7 @@ class V21DDTwoRouteAdd(nn.Module):
         )
         can_compile_final_diag_route = (
             route is not None
+            and depth_dd is not None
             and stacked_history is not None
             and not route.force_scalar_routes
             and route.raw_diag is None
@@ -2320,6 +2373,7 @@ class V21DDTwoRouteAdd(nn.Module):
         )
         can_compile_final_gate_ln_route = (
             route is not None
+            and depth_dd is not None
             and stacked_history is not None
             and not route.force_scalar_routes
             and route.raw_proj is None
@@ -2328,6 +2382,7 @@ class V21DDTwoRouteAdd(nn.Module):
         )
         can_compile_final_gate_ln_diag_route = (
             route is not None
+            and depth_dd is not None
             and stacked_history is not None
             and not route.force_scalar_routes
             and route.raw_diag is None
@@ -3018,6 +3073,7 @@ class ConceptLMV21Model(ConceptLMV2Model):
             "ENABLE_MUDD_TORCH_COMPILE"
         ) or _env_flag("ENABLE_CONCEPTLM_V21_DECODER_TORCH_COMPILE")
         self._compiled_run_v21_decoder: Optional[Callable[..., Tensor]] = None
+        self._v21_decoder_route_plans = self._build_v21_decoder_route_plans()
 
     def _assert_supported_v21_runtime(
         self,
@@ -3035,6 +3091,60 @@ class ConceptLMV21Model(ConceptLMV2Model):
             raise NotImplementedError(
                 "ConceptLM V2.1 per-layer routing currently requires fp8=False and fp4=False."
             )
+
+    def _build_v21_decoder_route_plans(self) -> tuple[_V21DecoderRoutePlan, ...]:
+        plans: list[_V21DecoderRoutePlan] = []
+        for layer_idx in range(self.concept_decoder_layers):
+            decoder_dd = None
+            concept_route = None
+            apply_decoder_dd = False
+            concept_route_layer_enabled = False
+            dd_two_route_force_call = False
+            if self.dd_two_route_add is not None:
+                decoder_dd = self.dd_two_route_add.get_decoder_dd(layer_idx)
+                concept_route = self.dd_two_route_add.get_concept_route(layer_idx)
+                apply_decoder_dd = (
+                    (not self.dd_two_route_add.disable_decoder_dd)
+                    and ((layer_idx + 1) % self.dd_two_route_add.every_n_layers == 0)
+                    and decoder_dd is not None
+                )
+                concept_route_layer_enabled = (
+                    concept_route is not None
+                    and (
+                        self.dd_two_route_add.concept_route_first_n < 0
+                        or layer_idx < self.dd_two_route_add.concept_route_first_n
+                    )
+                )
+                dd_two_route_force_call = not self.dd_two_route_add.active_only_routes
+
+            decoder_read_encoder_route = _v21_get_layer_module(
+                self.decoder_read_encoder_routes,
+                layer_idx,
+            )
+            decoder_read_encoder_layer_enabled = (
+                decoder_read_encoder_route is not None
+                and (
+                    self.concept_decoder_read_encoder_first_n < 0
+                    or layer_idx < self.concept_decoder_read_encoder_first_n
+                )
+            )
+            decoder_read_concept_route = _v21_get_layer_module(
+                self.decoder_read_concept_routes,
+                layer_idx,
+            )
+            plans.append(
+                _V21DecoderRoutePlan(
+                    dd_two_route_force_call=dd_two_route_force_call,
+                    decoder_dd=decoder_dd,
+                    concept_route=concept_route,
+                    apply_decoder_dd=apply_decoder_dd,
+                    concept_route_layer_enabled=concept_route_layer_enabled,
+                    decoder_read_encoder_route=decoder_read_encoder_route,
+                    decoder_read_encoder_layer_enabled=decoder_read_encoder_layer_enabled,
+                    decoder_read_concept_route=decoder_read_concept_route,
+                )
+            )
+        return tuple(plans)
 
     def _run_v21_block(
         self,
@@ -3316,6 +3426,7 @@ class ConceptLMV21Model(ConceptLMV2Model):
         layer_idx: int,
         final_concept_state: Optional[Tensor],
         decoder_concept_states: Optional[Tensor],
+        route: Optional[V21ConceptRouteAdd] = None,
     ) -> Optional[Tensor]:
         if self.final_read_concept_gate_logits is None:
             return None
@@ -3328,7 +3439,8 @@ class ConceptLMV21Model(ConceptLMV2Model):
             and layer_idx >= self.dd_two_route_add.concept_route_first_n
         ):
             return None
-        route = self.dd_two_route_add.get_concept_route(layer_idx)
+        if route is None:
+            route = self.dd_two_route_add.get_concept_route(layer_idx)
         if route is None:
             return None
         if not route.enable_final_concept_route:
@@ -3420,10 +3532,12 @@ class ConceptLMV21Model(ConceptLMV2Model):
             _v21_check_finite(f"decoder.layer{layer_idx}.raw", layer_out)
             hidden = layer_out
             dd_history.append(layer_out)
+            plan = self._v21_decoder_route_plans[layer_idx]
             final_read_gate = self._final_read_concept_gate_weights(
                 layer_idx,
                 final_concept_state,
                 decoder_concept_states,
+                route=plan.concept_route,
             )
             final_concept_scale = None
             decoder_read_concept_scale = None
@@ -3431,25 +3545,17 @@ class ConceptLMV21Model(ConceptLMV2Model):
                 final_concept_scale = final_read_gate[0]
                 decoder_read_concept_scale = final_read_gate[1]
             if self.dd_two_route_add is not None:
-                apply_decoder_dd = self.dd_two_route_add.applies_decoder_dd(layer_idx)
-                apply_concept_route = self.dd_two_route_add.applies_concept_route(
-                    layer_idx, dd_concept_states, final_concept_state
+                apply_concept_route = (
+                    plan.concept_route_layer_enabled
+                    and (dd_concept_states is not None or final_concept_state is not None)
                 )
                 apply_dd_two_route = (
-                    apply_decoder_dd
+                    plan.apply_decoder_dd
                     or apply_concept_route
-                    or not self.dd_two_route_add.active_only_routes
+                    or plan.dd_two_route_force_call
                 )
-                route = (
-                    self.dd_two_route_add.get_concept_route(layer_idx)
-                    if apply_dd_two_route
-                    else None
-                )
-                depth_dd = (
-                    self.dd_two_route_add.get_decoder_dd(layer_idx)
-                    if apply_dd_two_route
-                    else None
-                )
+                route = plan.concept_route if apply_dd_two_route else None
+                depth_dd = plan.decoder_dd if apply_dd_two_route else None
                 if (
                     apply_dd_two_route
                     and
@@ -3510,26 +3616,25 @@ class ConceptLMV21Model(ConceptLMV2Model):
                         )
                     _v21_check_finite(f"dd_two_route.layer{layer_idx}.concept_route", hidden)
                 elif apply_dd_two_route:
-                    hidden = self.dd_two_route_add(
+                    hidden = self.dd_two_route_add.forward_planned(
                         layer_idx,
                         hidden,
                         dd_history,
                         dd_concept_states,
                         final_concept_state,
                         final_concept_scale=final_concept_scale,
+                        depth_dd=depth_dd,
+                        route=route,
+                        apply_dd=plan.apply_decoder_dd,
+                        concept_route_layer_enabled=plan.concept_route_layer_enabled,
                     )
                 if apply_dd_two_route:
                     _v21_check_finite(f"decoder.layer{layer_idx}.dd_two_route_add", hidden)
-            decoder_read_encoder_route = _v21_get_layer_module(
-                self.decoder_read_encoder_routes, layer_idx
-            )
+            decoder_read_encoder_route = plan.decoder_read_encoder_route
             apply_decoder_read_encoder = (
                 decoder_read_encoder_route is not None
                 and decoder_encoder_states is not None
-                and (
-                    self.concept_decoder_read_encoder_first_n < 0
-                    or layer_idx < self.concept_decoder_read_encoder_first_n
-                )
+                and plan.decoder_read_encoder_layer_enabled
             )
             if apply_decoder_read_encoder:
                 hidden = decoder_read_encoder_route(
@@ -3543,8 +3648,8 @@ class ConceptLMV21Model(ConceptLMV2Model):
                     hidden,
                     decoder_read_encoder_route,
                 )
-            if self.decoder_read_concept_routes is not None and decoder_concept_states is not None:
-                hidden = self.decoder_read_concept_routes[layer_idx].forward_repeated_chunks(
+            if plan.decoder_read_concept_route is not None and decoder_concept_states is not None:
+                hidden = plan.decoder_read_concept_route.forward_repeated_chunks(
                     hidden,
                     decoder_concept_states,
                     self.concept_chunk_size,
