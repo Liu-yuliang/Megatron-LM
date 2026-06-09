@@ -538,17 +538,20 @@ class ConceptLMV22VQModel(ConceptLMV21Model):
             concept_layer_states,
         ) = self._concept_branch_v21(encoder_hidden_states, encoder_raw_layer_states)
 
+        route_source_context = self._build_route_source_context(concept_layer_states)
         final_concept_state, dd_concept_states = self._build_dd_concept_candidates(
             final_concept_chunk_states,
             repeated_final_concept_states,
-            concept_layer_states,
+            route_source_context.concept_layer_stack,
             encoder_hidden_states.shape[0],
         )
         _v21_check_finite("v22_vq.final_concept_state", final_concept_state)
         _v21_check_finite("v22_vq.dd_concept_states", dd_concept_states)
         decoder_encoder_states = self._build_decoder_encoder_states(encoder_raw_layer_states)
         _v21_check_finite("v22_vq.decoder_encoder_states", decoder_encoder_states)
-        decoder_concept_states = self._build_decoder_concept_states(concept_layer_states)
+        decoder_concept_states = self._build_decoder_concept_states(
+            route_source_context.concept_layer_stack
+        )
         _v21_check_finite("v22_vq.decoder_concept_states", decoder_concept_states)
 
         hidden_states = self._run_v21_decoder_compiled(
