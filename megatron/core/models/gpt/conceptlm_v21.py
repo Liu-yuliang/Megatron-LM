@@ -3075,6 +3075,206 @@ class ConceptLMV21Model(ConceptLMV2Model):
         self._compiled_run_v21_decoder: Optional[Callable[..., Tensor]] = None
         self._v21_decoder_route_plans = self._build_v21_decoder_route_plans()
 
+    def named_parameters(
+        self,
+        prefix: str = "",
+        recurse: bool = True,
+        remove_duplicate: bool = True,
+    ):
+        if (
+            not recurse
+            or not remove_duplicate
+            or not _env_flag("CONCEPTLM_V21_FORWARD_ORDER_NAMED_PARAMETERS", True)
+        ):
+            yield from super().named_parameters(
+                prefix=prefix,
+                recurse=recurse,
+                remove_duplicate=remove_duplicate,
+            )
+            return
+
+        seen: set[int] = set()
+
+        def with_prefix(name: str) -> str:
+            return f"{prefix}.{name}" if prefix else name
+
+        def emit_parameter(name: str):
+            parameter = self._parameters.get(name)
+            if parameter is None:
+                return
+            parameter_id = id(parameter)
+            if parameter_id in seen:
+                return
+            seen.add(parameter_id)
+            yield with_prefix(name), parameter
+
+        def emit_module(name: str, module: Optional[nn.Module] = None):
+            if module is None:
+                module = getattr(self, name, None)
+            if module is None:
+                return
+            for parameter_name, parameter in module.named_parameters(
+                prefix=with_prefix(name),
+                recurse=True,
+                remove_duplicate=False,
+            ):
+                parameter_id = id(parameter)
+                if parameter_id in seen:
+                    continue
+                seen.add(parameter_id)
+                yield parameter_name, parameter
+
+        def emit_layer_module(container_name: str, container: Optional[nn.Module], layer_idx: int):
+            if container is None:
+                return
+            key = _v21_layer_key(layer_idx)
+            if isinstance(container, nn.ModuleDict):
+                if key not in container:
+                    return
+                yield from emit_module(f"{container_name}.{key}", container[key])
+            elif isinstance(container, nn.ModuleList):
+                if not (0 <= int(layer_idx) < len(container)):
+                    return
+                yield from emit_module(
+                    f"{container_name}.{int(layer_idx)}",
+                    container[int(layer_idx)],
+                )
+
+        yield from emit_module("embedding")
+        yield from emit_module("rotary_pos_emb")
+
+        encoder = getattr(self, "encoder", None)
+        encoder_layers = getattr(encoder, "layers", None)
+        encoder_self_dd = getattr(self, "dd_encoder_self_dd", None)
+        encoder_depth_dds = getattr(encoder_self_dd, "depth_dds", None)
+        if isinstance(encoder_layers, nn.ModuleList):
+            for layer_idx, layer in enumerate(encoder_layers):
+                yield from emit_module(f"encoder.layers.{layer_idx}", layer)
+                yield from emit_layer_module(
+                    "dd_encoder_self_dd.depth_dds",
+                    encoder_depth_dds,
+                    layer_idx,
+                )
+            yield from emit_module(
+                "encoder.final_layernorm",
+                getattr(encoder, "final_layernorm", None),
+            )
+        else:
+            yield from emit_module("encoder")
+
+        if getattr(self, "concept_enable_chunk_dualpath_smoothing", False):
+            yield from emit_module("chunk_dualpath_b_proj")
+            yield from emit_module("chunk_dualpath_a_norm")
+            yield from emit_parameter("chunk_dualpath_alpha")
+            yield from emit_module("chunk_dualpath_b_norm")
+
+        yield from emit_module("concept_vq_input_norm")
+        yield from emit_module("concept_quantizer")
+
+        mlp_bottlenecks = getattr(self, "mlp_bottlenecks", None)
+        if isinstance(mlp_bottlenecks, nn.ModuleList):
+            for split_idx, bottleneck in enumerate(mlp_bottlenecks):
+                yield from emit_module(f"mlp_bottlenecks.{split_idx}", bottleneck)
+
+        concept_predictor = getattr(self, "concept_predictor", None)
+        if concept_predictor is not None:
+            yield from emit_module(
+                "concept_predictor.concept_read_encoder_shared_source_norm",
+                getattr(concept_predictor, "concept_read_encoder_shared_source_norm", None),
+            )
+            concept_layers = getattr(concept_predictor, "layers", None)
+            concept_self_dd = getattr(concept_predictor, "concept_self_dd", None)
+            concept_depth_dds = getattr(concept_self_dd, "depth_dds", None)
+            concept_read_encoder_routes = getattr(
+                concept_predictor,
+                "concept_read_encoder_routes",
+                None,
+            )
+            if isinstance(concept_layers, nn.ModuleList):
+                for layer_idx, layer in enumerate(concept_layers):
+                    yield from emit_module(f"concept_predictor.layers.{layer_idx}", layer)
+                    yield from emit_layer_module(
+                        "concept_predictor.concept_self_dd.depth_dds",
+                        concept_depth_dds,
+                        layer_idx,
+                    )
+                    yield from emit_layer_module(
+                        "concept_predictor.concept_read_encoder_routes",
+                        concept_read_encoder_routes,
+                        layer_idx,
+                    )
+                yield from emit_module(
+                    "concept_predictor.final_layernorm",
+                    getattr(concept_predictor, "final_layernorm", None),
+                )
+                yield from emit_module(
+                    "concept_predictor.prediction_heads",
+                    getattr(concept_predictor, "prediction_heads", None),
+                )
+            else:
+                yield from emit_module("concept_predictor")
+
+        yield from emit_module("fusion_tok_norm")
+        yield from emit_parameter("fusion_norm_alpha")
+        yield from emit_module("fusion_hl_norm")
+        yield from emit_parameter("fusion_alpha")
+
+        yield from emit_module("decoder_read_encoder_shared_source_norm")
+        yield from emit_module("decoder_read_concept_shared_source_norm")
+
+        decoder = getattr(self, "decoder", None)
+        decoder_layers = getattr(decoder, "layers", None)
+        dd_two_route_add = getattr(self, "dd_two_route_add", None)
+        decoder_dds = getattr(dd_two_route_add, "decoder_dds", None)
+        concept_routes = getattr(dd_two_route_add, "concept_routes", None)
+        decoder_read_encoder_routes = getattr(self, "decoder_read_encoder_routes", None)
+        decoder_read_concept_routes = getattr(self, "decoder_read_concept_routes", None)
+        if isinstance(decoder_layers, nn.ModuleList):
+            for layer_idx, layer in enumerate(decoder_layers):
+                yield from emit_module(f"decoder.layers.{layer_idx}", layer)
+                if layer_idx == 0:
+                    yield from emit_parameter("final_read_concept_gate_logits")
+                yield from emit_layer_module(
+                    "dd_two_route_add.decoder_dds",
+                    decoder_dds,
+                    layer_idx,
+                )
+                yield from emit_layer_module(
+                    "dd_two_route_add.concept_routes",
+                    concept_routes,
+                    layer_idx,
+                )
+                yield from emit_layer_module(
+                    "decoder_read_encoder_routes",
+                    decoder_read_encoder_routes,
+                    layer_idx,
+                )
+                yield from emit_layer_module(
+                    "decoder_read_concept_routes",
+                    decoder_read_concept_routes,
+                    layer_idx,
+                )
+            yield from emit_module(
+                "decoder.final_layernorm",
+                getattr(decoder, "final_layernorm", None),
+            )
+        else:
+            yield from emit_module("decoder")
+            yield from emit_parameter("final_read_concept_gate_logits")
+
+        yield from emit_module("output_layer")
+
+        for parameter_name, parameter in super().named_parameters(
+            prefix=prefix,
+            recurse=True,
+            remove_duplicate=False,
+        ):
+            parameter_id = id(parameter)
+            if parameter_id in seen:
+                continue
+            seen.add(parameter_id)
+            yield parameter_name, parameter
+
     def _assert_supported_v21_runtime(
         self,
         decoder_input: Tensor,
