@@ -117,12 +117,12 @@ def _add_conceptlm_v22_vq_args(parser):
     group.add_argument(
         "--conceptlm-backbone",
         type=str,
-        default="pythia",
+        default="olmo3",
         choices=["olmo3", "pythia", "gpt"],
     )
-    group.add_argument("--conceptlm-encoder-layers", type=int, default=6)
-    group.add_argument("--conceptlm-special-layers", type=int, default=6)
-    group.add_argument("--conceptlm-decoder-layers", type=int, default=6)
+    group.add_argument("--conceptlm-encoder-layers", type=int, default=16)
+    group.add_argument("--conceptlm-special-layers", type=int, default=8)
+    group.add_argument("--conceptlm-decoder-layers", type=int, default=16)
     group.add_argument("--conceptlm-chunk-size", type=int, default=4)
     _add_bool_pair(group, "conceptlm-shift-feature", True, "Shift repeated concept features by one token.")
     group.add_argument(
@@ -154,8 +154,8 @@ def _add_conceptlm_v22_vq_args(parser):
     group.add_argument(
         "--conceptlm-v22-vq-num-codebooks",
         type=int,
-        default=None,
-        help="Defaults to num_attention_heads when omitted.",
+        default=32,
+        help="Number of VQ codebooks.",
     )
     group.add_argument("--conceptlm-v22-vq-commitment-cost", type=float, default=0.25)
     group.add_argument(
@@ -182,7 +182,7 @@ def _add_conceptlm_v22_vq_args(parser):
     _add_bool_pair(
         group,
         "conceptlm-v21-dd-two-route-add",
-        False,
+        True,
         "Enable decoder DD plus concept two-route add.",
     )
     group.add_argument(
@@ -194,7 +194,7 @@ def _add_conceptlm_v22_vq_args(parser):
     _add_bool_pair(
         group,
         "conceptlm-v21-dd-two-route-add-enable-raw-concept-route",
-        True,
+        False,
         "Enable raw concept layer candidates in decoder concept routing.",
     )
     _add_bool_pair(
@@ -203,7 +203,7 @@ def _add_conceptlm_v22_vq_args(parser):
         True,
         "Enable final concept route into the decoder.",
     )
-    group.add_argument("--conceptlm-v21-dd-two-route-add-beta-init", type=float, default=0.3)
+    group.add_argument("--conceptlm-v21-dd-two-route-add-beta-init", type=float, default=0.05)
     group.add_argument("--conceptlm-v21-dd-two-route-add-every-n-layers", type=int, default=1)
     group.add_argument("--conceptlm-v21-dd-two-route-add-concept-route-first-n", type=int, default=-1)
     group.add_argument("--conceptlm-v21-dd-two-route-add-decoder-hidden-size", type=int, default=0)
@@ -211,7 +211,7 @@ def _add_conceptlm_v22_vq_args(parser):
     _add_bool_pair(
         group,
         "conceptlm-v21-dd-two-route-add-use-softmax",
-        True,
+        False,
         "Use softmax for decoder concept routing.",
     )
     _add_bool_pair(
@@ -241,7 +241,7 @@ def _add_conceptlm_v22_vq_args(parser):
     _add_bool_pair(
         group,
         "conceptlm-v21-dd-encoder-self-dd",
-        False,
+        True,
         "Enable encoder self-DD over layer history.",
     )
     group.add_argument("--conceptlm-v21-dd-encoder-self-dd-every-n-layers", type=int, default=1)
@@ -255,7 +255,7 @@ def _add_conceptlm_v22_vq_args(parser):
     _add_bool_pair(
         group,
         "conceptlm-v21-dd-concept-self-dd",
-        False,
+        True,
         "Enable concept self-DD over HLM layer history.",
     )
     group.add_argument("--conceptlm-v21-dd-concept-self-dd-every-n-layers", type=int, default=1)
@@ -275,19 +275,19 @@ def _add_conceptlm_v22_vq_args(parser):
     _add_bool_pair(
         group,
         "conceptlm-v21-enable-concept-read-encoder",
-        False,
+        True,
         "Enable encoder-to-concept residual routes.",
     )
     _add_bool_pair(
         group,
         "conceptlm-v21-enable-decoder-read-encoder",
-        False,
+        True,
         "Enable encoder-to-decoder residual routes.",
     )
     _add_bool_pair(
         group,
         "conceptlm-v21-enable-decoder-read-concept",
-        False,
+        True,
         "Enable concept-to-decoder residual routes.",
     )
     group.add_argument(
@@ -319,13 +319,13 @@ def _add_conceptlm_v22_vq_args(parser):
     _add_bool_pair(
         group,
         "conceptlm-v21-residual-flow-shared-source-norm",
-        False,
+        True,
         "Share one source norm per residual-flow source group.",
     )
     _add_bool_pair(
         group,
         "conceptlm-v21-final-read-concept-gate",
-        False,
+        True,
         "Use a per-layer softmax gate whose final-concept and decoder-read-concept weights sum to 1.",
     )
     group.add_argument(

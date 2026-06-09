@@ -83,6 +83,10 @@ def _active_only_routes_enabled(metadata: Optional[dict] = None) -> bool:
     return _env_flag("CONCEPTLM_V21_ACTIVE_ONLY_ROUTES")
 
 
+def _self_dd_unstacked_fastpath_enabled() -> bool:
+    return _env_flag("CONCEPTLM_V21_SELF_DD_UNSTACKED_FASTPATH", True)
+
+
 def _v21_layer_key(layer_idx: int) -> str:
     return str(int(layer_idx))
 
@@ -233,13 +237,18 @@ def _configure_v21_dynamo_cache() -> None:
 
 def _compile_v21(fn: Callable) -> Callable:
     _configure_v21_dynamo_cache()
-    return torch.compile(
-        fn,
-        backend="inductor",
-        mode="max-autotune-no-cudagraphs",
-        fullgraph=True,
-        dynamic=False,
+    kwargs: Dict[str, Any] = {
+        "backend": _env_str("CONCEPTLM_V21_ROUTE_TORCH_COMPILE_BACKEND", "inductor"),
+        "fullgraph": _env_flag("CONCEPTLM_V21_ROUTE_TORCH_COMPILE_FULLGRAPH", True),
+        "dynamic": _env_flag("CONCEPTLM_V21_ROUTE_TORCH_COMPILE_DYNAMIC", False),
+    }
+    mode = _env_str(
+        "CONCEPTLM_V21_ROUTE_TORCH_COMPILE_MODE",
+        "max-autotune-no-cudagraphs",
     )
+    if mode.strip().lower() not in ("", "none", "default"):
+        kwargs["mode"] = mode
+    return torch.compile(fn, **kwargs)
 
 
 def _compile_v21_configurable(
@@ -1085,7 +1094,18 @@ class V21DepthDD(nn.Module):
     def forward_unstacked(self, current_hidden: Tensor, history_states: list[Tensor]) -> Tensor:
         keep_indices = _v21_route_keep_indices(len(history_states), current_hidden.device)
         if keep_indices is not None:
-            history_states = [history_states[int(i)] for i in keep_indices.tolist()]
+            selected_history = [history_states[int(i)] for i in keep_indices.tolist()]
+            active_prev = len(selected_history)
+            normed_history = self.history_norm(torch.stack(selected_history, dim=2))
+            weights = self.w2(self.act(self.w1(current_hidden)))
+            weights = weights.index_select(-1, keep_indices)
+            static_a = self.static_a.index_select(0, keep_indices)
+            weights = weights + static_a.view(1, 1, active_prev)
+            if self.use_softmax:
+                weights = weights.softmax(dim=-1)
+            _v21_trace_tensor(f"depth_dd.layer{self.layer_idx}.weights", weights)
+            _v21_trace_tensor(f"depth_dd.layer{self.layer_idx}.history", normed_history)
+            return (weights.unsqueeze(-1) * normed_history).sum(dim=2)
         if keep_indices is None and len(history_states) != self.num_prev:
             raise RuntimeError(
                 f"unstacked V21DepthDD expects {self.num_prev} history states, "
@@ -1121,6 +1141,7 @@ class V21SelfDD(nn.Module):
         super().__init__()
         self.every_n_layers = max(1, int(every_n_layers))
         self.active_only_routes = _active_only_routes_enabled()
+        self.unstacked_fastpath = _self_dd_unstacked_fastpath_enabled()
 
         def make_depth_dd(layer_idx: int) -> V21DepthDD:
             return V21DepthDD(
@@ -1174,6 +1195,26 @@ class V21SelfDD(nn.Module):
         if history_states is None:
             raise RuntimeError("V21SelfDD active layer requires history_states")
         return depth_dd(history_states, current_hidden)
+
+    def forward_unstacked(
+        self,
+        layer_idx: int,
+        current_hidden: Tensor,
+        history_states: Optional[list[Tensor]],
+    ) -> Tensor:
+        if (layer_idx + 1) % self.every_n_layers != 0:
+            if self.active_only_routes:
+                return current_hidden
+            return _v21_add_zero_param_dependency(
+                current_hidden,
+                self.depth_dds[layer_idx],
+            )
+        depth_dd = _v21_get_layer_module(self.depth_dds, layer_idx)
+        if depth_dd is None:
+            return current_hidden
+        if history_states is None:
+            raise RuntimeError("V21SelfDD active layer requires history_states")
+        return depth_dd.forward_unstacked(current_hidden, history_states)
 
 
 @_compile_v21
@@ -2599,16 +2640,28 @@ class ConceptPredictorV21(nn.Module):
                 concept_history.append(raw_out)
             if self.concept_self_dd is not None:
                 dd_history.append(raw_out)
-                history_states = (
-                    torch.stack(dd_history, dim=2)
-                    if self.concept_self_dd.needs_history(layer_idx)
-                    else None
-                )
-                layer_out = self.concept_self_dd(
-                    layer_idx,
-                    layer_out,
-                    history_states,
-                )
+                if self.concept_self_dd.unstacked_fastpath:
+                    history_states = (
+                        dd_history
+                        if self.concept_self_dd.needs_history(layer_idx)
+                        else None
+                    )
+                    layer_out = self.concept_self_dd.forward_unstacked(
+                        layer_idx,
+                        layer_out,
+                        history_states,
+                    )
+                else:
+                    history_states = (
+                        torch.stack(dd_history, dim=2)
+                        if self.concept_self_dd.needs_history(layer_idx)
+                        else None
+                    )
+                    layer_out = self.concept_self_dd(
+                        layer_idx,
+                        layer_out,
+                        history_states,
+                    )
                 _v21_check_finite(f"concept.layer{layer_idx}.self_dd", layer_out)
             concept_read_encoder_route = _v21_get_layer_module(
                 self.concept_read_encoder_routes, layer_idx
@@ -3057,12 +3110,24 @@ class ConceptLMV21Model(ConceptLMV2Model):
             if self.dd_encoder_self_dd is None:
                 return layer_out
             dd_history.append(raw_out)
-            history_states = (
-                torch.stack(dd_history, dim=2)
-                if self.dd_encoder_self_dd.needs_history(layer_idx)
-                else None
-            )
-            out = self.dd_encoder_self_dd(layer_idx, layer_out, history_states)
+            if self.dd_encoder_self_dd.unstacked_fastpath:
+                history_states = (
+                    dd_history
+                    if self.dd_encoder_self_dd.needs_history(layer_idx)
+                    else None
+                )
+                out = self.dd_encoder_self_dd.forward_unstacked(
+                    layer_idx,
+                    layer_out,
+                    history_states,
+                )
+            else:
+                history_states = (
+                    torch.stack(dd_history, dim=2)
+                    if self.dd_encoder_self_dd.needs_history(layer_idx)
+                    else None
+                )
+                out = self.dd_encoder_self_dd(layer_idx, layer_out, history_states)
             _v21_check_finite(f"encoder.layer{layer_idx}.self_dd", out)
             return out
 

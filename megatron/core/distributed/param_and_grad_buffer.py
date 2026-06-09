@@ -313,10 +313,33 @@ class _ParamAndGradBucketGroup:
 
         if force_sync:
             if self.param_gather_handle is not None:
-                self.param_gather_handle.wait()
-                self.param_gather_handle = None
-                return
+                if not self.ddp_config.use_distributed_optimizer:
+                    current_dispatch = self.param_gather_dispatched
+                    self.finish_pending_param_sync(copy_params=current_dispatch)
+                    if current_dispatch:
+                        return
+                else:
+                    self.param_gather_handle.wait()
+                    self.param_gather_handle = None
+                    return
         else:
+            if self.param_gather_handle is not None:
+                if not self.ddp_config.use_distributed_optimizer:
+                    if self.param_gather_dispatched:
+                        warnings.warn(
+                            "A parameter all-gather operation was already pending when another "
+                            "non-forced parameter sync was requested. This can happen when "
+                            "parameter registration order does not match forward execution order; "
+                            "leaving the existing all-gather in flight."
+                        )
+                        return
+                    warnings.warn(
+                        "A stale parameter all-gather handle was still pending when a new "
+                        "parameter sync was requested. This can happen when parameter "
+                        "registration order does not match forward execution order; "
+                        "dropping the stale all-gather before dispatching the next one."
+                    )
+                    self.finish_pending_param_sync(copy_params=False)
             assert self.param_gather_handle is None
 
         async_op = self.ddp_config.overlap_param_gather and not force_sync
@@ -432,6 +455,77 @@ class _ParamAndGradBucketGroup:
                 self.param_gather_handle = None
         self.param_gather_dispatched = True
 
+    def _complete_param_sync_after_wait(self):
+        """Copy gathered params back after a pending param all-gather has completed."""
+        # For the mxfp8_param with "reuse_grad_buf_for_mxfp8_param_ag=True",
+        # we need to copy the param_data from the shared_param/grad_buffer to param.data
+        # after the param all-gather.
+        if self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag:
+            for bucket in self.buckets:
+                is_bf16_weight_bucket = False
+                for param in bucket.params:
+                    # Skip copying since bf16 weights in the mxfp8 model
+                    # are already mapped to param.data.
+                    if not is_float8tensor(param):
+                        is_bf16_weight_bucket = True
+                        break
+                    param_start, param_end = bucket.param_to_index[param]
+                    param_slice = bucket.param_data.view(-1)[param_start:param_end]
+                    param.data.copy_(param_slice.view(param.data.shape))
+                if is_bf16_weight_bucket:
+                    continue
+                # All-gathered params are not needed after being copied to param.data.
+                # Zero out the param buffer (shared with grad buffer) for gradient accumulation.
+                # We cannot zero out the entire grad buffer because one grad buffer may
+                # correspond to multiple param buffers. If we zero out the entire grad buffer,
+                # it would clear the data of those param buffers that have not yet completed AG.
+                bucket.param_data.zero_()
+        elif not self.ddp_config.use_distributed_optimizer:
+            for bucket in self.buckets:
+                if bucket.layerwise_gather_list is None:
+                    continue
+                # Unflatten and copy gathered params for each rank.
+                for idx, params in enumerate(bucket.layerwise_params_list):
+                    # Skip local params and empty tensors.
+                    if (
+                        len(params) == 0
+                        or idx == self.intra_distributed_optimizer_instance_rank
+                    ):
+                        continue
+                    updated_params = _unflatten_dense_tensors(
+                        bucket.layerwise_gather_list[idx], params
+                    )
+                    for updated_p, model_p in zip(updated_params, params):
+                        model_p.data.copy_(updated_p)
+                bucket.layerwise_gather_list = None
+                # Zero out grad_data since it was reused as the all-gather
+                # receive buffer. Without this, accumulation into main_grad
+                # (a view into grad_data) would start from the result of the
+                # latest parameter all-gather instead of zero.
+                bucket.grad_data.zero_()
+        else:
+            fp8_params = []
+            for bucket in self.buckets:
+                for param in bucket.params:
+                    if is_float8tensor(param):
+                        fp8_params.append(param)
+            if len(fp8_params) > 0:
+                post_all_gather_processing(fp8_params)
+
+    def finish_pending_param_sync(self, copy_params: bool = True):
+        """Finish an already-dispatched param all-gather without prefetching another bucket."""
+        if self.param_gather_handle is None:
+            return
+        self.param_gather_handle.wait()
+        self.param_gather_handle = None
+        if copy_params:
+            self._complete_param_sync_after_wait()
+        elif not self.ddp_config.use_distributed_optimizer:
+            for bucket in self.buckets:
+                bucket.layerwise_gather_list = None
+                bucket.grad_data.zero_()
+            self.param_gather_dispatched = False
+
     def finish_param_sync(self, skip_next_bucket_dispatch: bool = False):
         """
         Finishes param sync communication operation for this bucket. Dispatches
@@ -469,60 +563,7 @@ class _ParamAndGradBucketGroup:
                 else:
                     self.next_param_gather_bucket_group.start_param_sync()
 
-            # For the mxfp8_param with "reuse_grad_buf_for_mxfp8_param_ag=True",
-            # we need to copy the param_data from the shared_param/grad_buffer to param.data
-            # after the param all-gather.
-            if self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag:
-                for bucket in self.buckets:
-                    is_bf16_weight_bucket = False
-                    for param in bucket.params:
-                        # Skip copying since bf16 weights in the mxfp8 model
-                        # are already mapped to param.data.
-                        if not is_float8tensor(param):
-                            is_bf16_weight_bucket = True
-                            break
-                        param_start, param_end = bucket.param_to_index[param]
-                        param_slice = bucket.param_data.view(-1)[param_start:param_end]
-                        param.data.copy_(param_slice.view(param.data.shape))
-                    if is_bf16_weight_bucket:
-                        continue
-                    # All-gathered params are not needed after being copied to param.data.
-                    # Zero out the param buffer (shared with grad buffer) for gradient accumulation.
-                    # We cannot zero out the entire grad buffer because one grad buffer may
-                    # correspond to multiple param buffers. If we zero out the entire grad buffer,
-                    # it would clear the data of those param buffers that have not yet completed AG.
-                    bucket.param_data.zero_()
-            elif not self.ddp_config.use_distributed_optimizer:
-                for bucket in self.buckets:
-                    if bucket.layerwise_gather_list is None:
-                        continue
-                    # Unflatten and copy gathered params for each rank.
-                    for idx, params in enumerate(bucket.layerwise_params_list):
-                        # Skip local params and empty tensors.
-                        if (
-                            len(params) == 0
-                            or idx == self.intra_distributed_optimizer_instance_rank
-                        ):
-                            continue
-                        updated_params = _unflatten_dense_tensors(
-                            bucket.layerwise_gather_list[idx], params
-                        )
-                        for updated_p, model_p in zip(updated_params, params):
-                            model_p.data.copy_(updated_p)
-                    bucket.layerwise_gather_list = None
-                    # Zero out grad_data since it was reused as the all-gather
-                    # receive buffer. Without this, accumulation into main_grad
-                    # (a view into grad_data) would start from the result of the
-                    # latest parameter all-gather instead of zero.
-                    bucket.grad_data.zero_()
-            else:
-                fp8_params = []
-                for bucket in self.buckets:
-                    for param in bucket.params:
-                        if is_float8tensor(param):
-                            fp8_params.append(param)
-                if len(fp8_params) > 0:
-                    post_all_gather_processing(fp8_params)
+            self._complete_param_sync_after_wait()
 
     def start_grad_sync(self, force_all_reduce: Optional[bool] = False):
         """
