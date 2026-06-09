@@ -52,6 +52,13 @@ class ConceptLMV21Output:
     concept_metrics: Dict[str, Tensor]
 
 
+@dataclass
+class _V21RouteSourceContext:
+    """Forward-local cache for source tensors shared by multiple route consumers."""
+
+    concept_layer_stack: Optional[Tensor] = None
+
+
 def _env_flag(name: str, default: bool = False) -> bool:
     value = os.environ.get(name)
     if value is None:
@@ -3257,29 +3264,47 @@ class ConceptLMV21Model(ConceptLMV2Model):
             concept_layer_states,
         )
 
+    def _build_route_source_context(
+        self,
+        concept_layer_states: Optional[tuple[Tensor, ...]],
+    ) -> _V21RouteSourceContext:
+        if concept_layer_states is None:
+            return _V21RouteSourceContext()
+        need_concept_layer_stack = (
+            (
+                self.dd_concept_builder is not None
+                and self.dd_concept_builder.concept_source != "final"
+            )
+            or self.decoder_read_concept_routes is not None
+        )
+        if not need_concept_layer_stack:
+            return _V21RouteSourceContext()
+        return _V21RouteSourceContext(
+            concept_layer_stack=torch.stack(
+                _v21_route_select_sequence(concept_layer_states),
+                dim=2,
+            )
+        )
+
     def _build_dd_concept_candidates(
         self,
         final_concept_chunk_states: Tensor,
         repeated_final_concept_states: Tensor,
-        concept_layer_states: Optional[tuple[Tensor, ...]],
+        concept_layer_stack: Optional[Tensor],
         seq_len: int,
     ) -> tuple[Tensor, Optional[Tensor]]:
         if self.dd_concept_builder is None:
             return repeated_final_concept_states, None
-        layer_stack = None
-        if concept_layer_states is not None:
-            layer_stack = torch.stack(_v21_route_select_sequence(concept_layer_states), dim=2)
-        return self.dd_concept_builder(final_concept_chunk_states, layer_stack, seq_len)
+        return self.dd_concept_builder(final_concept_chunk_states, concept_layer_stack, seq_len)
 
     def _build_decoder_concept_states(
         self,
-        concept_layer_states: Optional[tuple[Tensor, ...]],
+        concept_layer_stack: Optional[Tensor],
     ) -> Optional[Tensor]:
-        if self.decoder_read_concept_routes is None or concept_layer_states is None:
+        if self.decoder_read_concept_routes is None or concept_layer_stack is None:
             return None
-        layer_stack = torch.stack(_v21_route_select_sequence(concept_layer_states), dim=2)
-        zero_chunk = torch.zeros_like(layer_stack[:1])
-        decoder_concept_states = torch.cat((zero_chunk, layer_stack), dim=0)
+        zero_chunk = torch.zeros_like(concept_layer_stack[:1])
+        decoder_concept_states = torch.cat((zero_chunk, concept_layer_stack), dim=0)
         if self.decoder_read_concept_shared_source_norm is not None:
             decoder_concept_states = self.decoder_read_concept_shared_source_norm(
                 decoder_concept_states
@@ -3731,14 +3756,17 @@ class ConceptLMV21Model(ConceptLMV2Model):
             concept_layer_states,
         ) = self._concept_branch_v21(encoder_hidden_states, encoder_raw_layer_states)
 
+        route_source_context = self._build_route_source_context(concept_layer_states)
         final_concept_state, dd_concept_states = self._build_dd_concept_candidates(
             final_concept_chunk_states,
             repeated_final_concept_states,
-            concept_layer_states,
+            route_source_context.concept_layer_stack,
             encoder_hidden_states.shape[0],
         )
         decoder_encoder_states = self._build_decoder_encoder_states(encoder_raw_layer_states)
-        decoder_concept_states = self._build_decoder_concept_states(concept_layer_states)
+        decoder_concept_states = self._build_decoder_concept_states(
+            route_source_context.concept_layer_stack
+        )
 
         hidden_states = self._run_v21_decoder_compiled(
             decoder_hidden_states,
