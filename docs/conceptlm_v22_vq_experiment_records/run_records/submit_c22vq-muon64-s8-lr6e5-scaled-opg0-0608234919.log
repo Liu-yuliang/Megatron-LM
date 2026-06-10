@@ -1,0 +1,4 @@
+06-08 23:49:25 [INFO] auto restart is not enabled, this job will not be restarted when issues occur
+06-08 23:49:25 [INFO] rjob name is complex, normalize rjob metadata name from c22vq-muon64-s8-lr6e5-scaled-opg0-0608234919 to c22vq-muon64-s8-lr6e5-scaled-opg0-0608234919-152d6
+06-08 23:49:27 [INFO] created rjob_name: c22vq-muon64-s8-lr6e5-scaled-opg0-0608234919-152d6
+

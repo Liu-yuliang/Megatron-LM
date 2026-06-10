@@ -1,0 +1,45 @@
+date=2026-06-08T23:50:30+08:00
+repo_root=/mnt/shared-storage-gpfs2/plm-gpfs/jyhuang/works/megatron_ConceptlmV2
+run_dir=/mnt/shared-storage-gpfs2/plm-gpfs/jyhuang/runs/concept_olmo3_v22_vq_muon_64g_special8_lr6e5_scaledtrunc_opg0_retry_0608234919/run/c22vq-muon64-s8-lr6e5-scaled-opg0-0608234919
+hf_model_dir=/mnt/shared-storage-gpfs2/plm-gpfs/public_data_model/model/Olmo-3-1025-7B-stage1-step1413814
+world_size=64
+gpus_per_node=8
+node_count=8
+node_rank=2
+master_addr=10.102.252.36
+master_port=6028
+precision=bf16
+transformer_impl=transformer_engine
+layer_spec=megatron.core.models.gpt.olmo3_layer_specs olmo3_layer_spec
+olmo3_qk_norm_impl=te
+attention_backend=flash
+init_method_variant=scaled_truncated_normal
+init_method_std=0.02
+wandb_enabled=1
+wandb_mode=offline
+wandb_project=ConceptLM
+wandb_exp_name=c22vq-muon64-s8-lr6e5-scaled-opg0-0608234919
+wandb_save_dir=/mnt/shared-storage-gpfs2/plm-gpfs/jyhuang/runs/concept_olmo3_v22_vq_muon_64g_special8_lr6e5_scaledtrunc_opg0_retry_0608234919/run/c22vq-muon64-s8-lr6e5-scaled-opg0-0608234919/wandb
+optimizer=muon
+hidden_rank_log_interval=500
+hidden_rank_log_tokens=1024
+hidden_rank_rtol=1e-3
+hidden_rank_center=1
+hidden_rank_log_path=/mnt/shared-storage-gpfs2/plm-gpfs/jyhuang/runs/concept_olmo3_v22_vq_muon_64g_special8_lr6e5_scaledtrunc_opg0_retry_0608234919/run/c22vq-muon64-s8-lr6e5-scaled-opg0-0608234919/results/exit_hidden_rank.jsonl
+rerun_mode=disabled
+olmo3_z_loss_multiplier=1e-5
+olmo3_embedding_weight_decay_zero=1
+grad_reduce_in_bf16=0
+save_full_state=1
+tp=1 pp=1 cp=1 mbs=1 gbs=512 seq=8192 train_iters=1430512
+checkpoint_dir=/mnt/shared-storage-gpfs2/plm-gpfs/jyhuang/runs/concept_olmo3_v22_vq_muon_64g_special8_lr6e5_scaledtrunc_opg0_retry_0608234919/checkpoints
+train_entrypoint=pretrain_conceptlm_v22_vq.py
+load_dir=
+save_interval=10000
+torchrun_args=--nproc_per_node torchrun_args=8 torchrun_args=--nnodes torchrun_args=8 torchrun_args=--node_rank torchrun_args=2 torchrun_args=--master_addr torchrun_args=10.102.252.36 torchrun_args=--master_port torchrun_args=6028 
+model_args=--use-mcore-models model_args=--transformer-impl model_args=transformer_engine model_args=--spec model_args=megatron.core.models.gpt.olmo3_layer_specs model_args=olmo3_layer_spec model_args=--num-layers model_args=32 model_args=--hidden-size model_args=4096 model_args=--ffn-hidden-size model_args=11008 model_args=--num-attention-heads model_args=32 model_args=--kv-channels model_args=128 model_args=--seq-length model_args=8192 model_args=--max-position-embeddings model_args=8192 model_args=--position-embedding-type model_args=rope model_args=--rotary-base model_args=500000 model_args=--rotary-percent model_args=1.0 model_args=--make-vocab-size-divisible-by model_args=1 model_args=--window-size model_args=4096\,0 model_args=--window-attn-skip-freq model_args=4 model_args=--qk-layernorm model_args=--swiglu model_args=--normalization model_args=RMSNorm model_args=--norm-epsilon model_args=1e-6 model_args=--attention-dropout model_args=0.0 model_args=--hidden-dropout model_args=0.0 model_args=--disable-bias-linear model_args=--untie-embeddings-and-output-weights model_args=--init-method-std model_args=0.02 model_args=--init-method-variant model_args=scaled_truncated_normal 
+train_args=--micro-batch-size train_args=1 train_args=--global-batch-size train_args=512 train_args=--train-iters train_args=1430512 train_args=--lr-decay-iters train_args=1430512 train_args=--lr-warmup-iters train_args=2000 train_args=--lr train_args=6.0e-5 train_args=--min-lr train_args=6.0e-6 train_args=--lr-decay-style train_args=cosine train_args=--clip-grad train_args=1.0 train_args=--weight-decay train_args=0.1 train_args=--optimizer train_args=muon train_args=--adam-beta1 train_args=0.9 train_args=--adam-beta2 train_args=0.95 train_args=--adam-eps train_args=1.0e-8 train_args=--bf16 train_args=--cross-entropy-loss-fusion 
+parallel_args=--tensor-model-parallel-size parallel_args=1 parallel_args=--pipeline-model-parallel-size parallel_args=1 parallel_args=--context-parallel-size parallel_args=1 parallel_args=--attention-backend parallel_args=flash parallel_args=--use-distributed-optimizer parallel_args=--overlap-grad-reduce parallel_args=--ddp-bucket-size parallel_args=240000000 parallel_args=--ddp-pad-buckets-for-high-nccl-busbw parallel_args=--fused-residual-rmsnorm 
+data_args=--tokenizer-type data_args=HuggingFaceTokenizer data_args=--tokenizer-model data_args=/mnt/shared-storage-gpfs2/plm-gpfs/public_data_model/model/Olmo-3-1025-7B-stage1-step1413814 data_args=--vocab-size data_args=100278 data_args=--data-cache-path data_args=/mnt/shared-storage-gpfs2/plm-gpfs/jyhuang/runs/concept_olmo3_v22_vq_muon_64g_special8_lr6e5_scaledtrunc_opg0_retry_0608234919/run/c22vq-muon64-s8-lr6e5-scaled-opg0-0608234919/data_cache/real data_args=--split data_args=100\,0\,0 data_args=--no-create-attention-mask-in-dataloader data_args=--num-workers data_args=2 data_args=--data-args-path data_args=/mnt/shared-storage-gpfs2/plm-gpfs/public_data_model/data/dolma3_mix-6T/megatron_olmo3_8192/data_args_path.txt data_args=--per-dataset-sequences-path data_args=/mnt/shared-storage-gpfs2/plm-gpfs/public_data_model/data/dolma3_mix-6T/megatron_olmo3_8192/per_dataset_sequences.json data_args=--no-mmap-bin-files 
+logging_args=--log-interval logging_args=1 logging_args=--eval-iters logging_args=0 logging_args=--eval-interval logging_args=1000 logging_args=--rerun-mode logging_args=disabled logging_args=--log-throughput logging_args=--log-timers-to-tensorboard logging_args=--distributed-timeout-minutes logging_args=60 logging_args=--tensorboard-dir logging_args=/mnt/shared-storage-gpfs2/plm-gpfs/jyhuang/runs/concept_olmo3_v22_vq_muon_64g_special8_lr6e5_scaledtrunc_opg0_retry_0608234919/run/c22vq-muon64-s8-lr6e5-scaled-opg0-0608234919/tensorboard logging_args=--manual-gc logging_args=--manual-gc-interval logging_args=10 logging_args=--empty-unused-memory-level logging_args=0 logging_args=--wandb-project logging_args=ConceptLM logging_args=--wandb-exp-name logging_args=c22vq-muon64-s8-lr6e5-scaled-opg0-0608234919 logging_args=--wandb-save-dir logging_args=/mnt/shared-storage-gpfs2/plm-gpfs/jyhuang/runs/concept_olmo3_v22_vq_muon_64g_special8_lr6e5_scaledtrunc_opg0_retry_0608234919/run/c22vq-muon64-s8-lr6e5-scaled-opg0-0608234919/wandb logging_args=--wandb-entity logging_args=iammi-nanjing-university 
+checkpoint_args=--save checkpoint_args=/mnt/shared-storage-gpfs2/plm-gpfs/jyhuang/runs/concept_olmo3_v22_vq_muon_64g_special8_lr6e5_scaledtrunc_opg0_retry_0608234919/checkpoints checkpoint_args=--save-interval checkpoint_args=10000 checkpoint_args=--ckpt-format checkpoint_args=torch_dist 

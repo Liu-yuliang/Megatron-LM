@@ -1,0 +1,4 @@
+06-10 01:31:36 [INFO] rjob c22vq-s3d-base-16g-0610012914-93361608 (showname=c22vq-s3d-base-16g-0610012914): Inqueue
+06-10 01:31:36 [INFO]   |- task t0: 2 replicas {'active': 0, 'succeeded': 0, 'failed': 0, 'created_failed': 0, 'pending': 0, 'stopped': 0}
+06-10 01:31:36 [INFO]        |- replica c22vq-s3d-base-16g-0610012914-93361608-cfcd2: STARTING, , 
+06-10 01:31:36 [INFO]        |- replica c22vq-s3d-base-16g-0610012914-93361608-c4ca4: STARTING, , 

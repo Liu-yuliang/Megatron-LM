@@ -1,0 +1,7 @@
+date=2026-06-10T00:59:07+08:00
+base_commit=365cd0744005126b1288b0e044a6d66d8d2992dd
+new_commit=e8c0e9e3246820da5133485b60bfc58c7e4292d0
+base_metadata=c22vq-s2r-base-16g-0610005716-37147556
+new_metadata=c22vq-s2r-new-16g-0610005716-44432979
+push_status=failed: github https credentials unavailable
+previous_failed_attempt=/mnt/shared-storage-gpfs2/plm-gpfs/ylliu/scale_up/train_conceptlm_V22_olmo_7B/ab_step2_routectx_0610004443/FAILED_ATTEMPT.md

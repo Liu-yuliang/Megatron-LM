@@ -1,0 +1,8 @@
+date=2026-06-09T17:11:47+08:00
+job_name=dryrun-c22vq-muon64-s8-lr6e5-scaled-opg0
+metadata_name=fake-dryrun-c22vq-muon64-s8-lr6e5-scaled-opg0-metadata
+model=olmo3
+entrypoint=/mnt/shared-storage-gpfs2/plm-gpfs/ylliu/scale_up/train_conceptlm_V22_olmo_7B/repo/examples/public_training_bench/train_olmo3_7b.sh
+repo_root=/mnt/shared-storage-gpfs2/plm-gpfs/ylliu/scale_up/train_conceptlm_V22_olmo_7B/repo
+submit_log=/mnt/shared-storage-gpfs2/plm-gpfs/ylliu/scale_up/train_conceptlm_V22_olmo_7B/dryruns/local_submit_verify_20260609_171147/run/rjob_submissions/submit_dryrun-c22vq-muon64-s8-lr6e5-scaled-opg0.log
+[FAKE_RJOB] get args: get fake-dryrun-c22vq-muon64-s8-lr6e5-scaled-opg0-metadata --namespace ailab-plm

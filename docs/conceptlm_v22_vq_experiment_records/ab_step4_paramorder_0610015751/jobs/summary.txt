@@ -1,0 +1,8 @@
+date=2026-06-10T01:59:32+08:00
+base_commit=1ca63d1cc17d2f69afe0ae8588a8c0da8dcfdadc
+new_commit=6ef82efbfc93fad97f9692bbee6c1d75f0893b2b
+base_metadata=c22vq-s4p-base-16g-0610015751-63204750
+new_metadata=c22vq-s4p-new-16g-0610015751-68934843
+push_status=failed: github https credentials unavailable
+previous_pass=/mnt/shared-storage-gpfs2/plm-gpfs/ylliu/scale_up/train_conceptlm_V22_olmo_7B/ab_step3_decoderroute_0610012914/RESULT.md
+step4_change=forward-order named_parameters without module tree, state_dict, or forward math changes

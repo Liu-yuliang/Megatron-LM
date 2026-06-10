@@ -1,0 +1,11 @@
+Submitting ConceptLM V2.2-VQ OLMo3 job: align16-prev-c22vq-muon-s8-lr6e5-0609172152
+  layers: olmo3_backbone=olmo3 num_layers=32 encoder=16 decoder=16 special=8
+  hidden: hidden_size=4096 ffn_hidden_size=11008 heads=32 kv_channels=128 num_codebooks=32
+  optimizer=muon
+  checkpoint_dir=/mnt/shared-storage-gpfs2/plm-gpfs/ylliu/scale_up/train_conceptlm_V22_olmo_7B/align16_0609172152/prev/checkpoints
+Submitting align16-prev-c22vq-muon-s8-lr6e5-0609172152: model=olmo3 replicas=2 gpus=8 entrypoint=/mnt/shared-storage-gpfs2/plm-gpfs/jyhuang/works/megatron_ConceptlmV2/examples/public_training_bench/train_olmo3_7b.sh
+06-09 17:21:55 [INFO] auto restart is not enabled, this job will not be restarted when issues occur
+06-09 17:21:55 [INFO] rjob name is complex, normalize rjob metadata name from align16-prev-c22vq-muon-s8-lr6e5-0609172152 to align16-prev-c22vq-muon-s8-lr6e5-0609172152-26879
+06-09 17:21:56 [INFO] created rjob_name: align16-prev-c22vq-muon-s8-lr6e5-0609172152-26879
+
+metadata_name=align16-prev-c22vq-muon-s8-lr6e5-0609172152-26879

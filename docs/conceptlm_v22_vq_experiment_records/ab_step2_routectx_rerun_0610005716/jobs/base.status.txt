@@ -1,0 +1,4 @@
+06-10 00:59:01 [INFO] rjob c22vq-s2r-base-16g-0610005716-37147556 (showname=c22vq-s2r-base-16g-0610005716): Inqueue
+06-10 00:59:01 [INFO]   |- task t0: 2 replicas {'active': 0, 'succeeded': 0, 'failed': 0, 'created_failed': 0, 'pending': 0, 'stopped': 0}
+06-10 00:59:01 [INFO]        |- replica c22vq-s2r-base-16g-0610005716-37147556-c4ca4: STARTING, , 
+06-10 00:59:01 [INFO]        |- replica c22vq-s2r-base-16g-0610005716-37147556-cfcd2: STARTING, , 

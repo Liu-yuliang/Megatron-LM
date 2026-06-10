@@ -1,0 +1,16 @@
+date=2026-06-09T17:10:12+08:00
+source_repo=/mnt/shared-storage-gpfs2/plm-gpfs/jyhuang/works/megatron_ConceptlmV2
+target_repo=/mnt/shared-storage-gpfs2/plm-gpfs/ylliu/scale_up/train_conceptlm_V22_olmo_7B/repo
+
+== du ==
+479M	/mnt/shared-storage-gpfs2/plm-gpfs/jyhuang/works/megatron_ConceptlmV2
+314M	/mnt/shared-storage-gpfs2/plm-gpfs/ylliu/scale_up/train_conceptlm_V22_olmo_7B/repo
+
+== largest source files over 50M ==
+90762522 /mnt/shared-storage-gpfs2/plm-gpfs/jyhuang/works/megatron_ConceptlmV2/.git/objects/pack/pack-1e2612c9885dbfa5b110b89692788dbdc9be0375.pack
+
+== largest target files over 50M ==
+
+== rsync dry-run delta after excludes ==
+>f.st...... examples/public_training_bench/launch_concept_v22_vq_olmo3_128g.sh
+>f.st...... examples/public_training_bench/train_concept_v22_vq_olmo3_7b.sh

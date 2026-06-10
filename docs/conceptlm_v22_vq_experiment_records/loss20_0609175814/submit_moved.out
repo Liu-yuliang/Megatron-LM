@@ -1,0 +1,16 @@
+Submitting loss20-moved-c22vq-muon-s8-lr6e5-0609175814
+  repo_root=/mnt/shared-storage-gpfs2/plm-gpfs/ylliu/scale_up/train_conceptlm_V22_olmo_7B/repo
+  run_base=/mnt/shared-storage-gpfs2/plm-gpfs/ylliu/scale_up/train_conceptlm_V22_olmo_7B/loss20_0609175814/moved/run
+  optimizer=muon lr=6.0e-5 min_lr=6.0e-6 wd=0.1
+  init_method_variant=scaled_truncated_normal
+Submitting ConceptLM V2.2-VQ OLMo3 job: loss20-moved-c22vq-muon-s8-lr6e5-0609175814
+  layers: olmo3_backbone=olmo3 num_layers=32 encoder=16 decoder=16 special=8
+  hidden: hidden_size=4096 ffn_hidden_size=11008 heads=32 kv_channels=128 num_codebooks=32
+  optimizer=muon
+  checkpoint_dir=/mnt/shared-storage-gpfs2/plm-gpfs/ylliu/scale_up/train_conceptlm_V22_olmo_7B/loss20_0609175814/moved/run/checkpoints
+Submitting loss20-moved-c22vq-muon-s8-lr6e5-0609175814: model=olmo3 replicas=2 gpus=8 entrypoint=/mnt/shared-storage-gpfs2/plm-gpfs/ylliu/scale_up/train_conceptlm_V22_olmo_7B/repo/examples/public_training_bench/train_olmo3_7b.sh
+06-09 17:58:18 [INFO] auto restart is not enabled, this job will not be restarted when issues occur
+06-09 17:58:18 [INFO] rjob name is complex, normalize rjob metadata name from loss20-moved-c22vq-muon-s8-lr6e5-0609175814 to loss20-moved-c22vq-muon-s8-lr6e5-0609175814-00298
+06-09 17:58:18 [INFO] created rjob_name: loss20-moved-c22vq-muon-s8-lr6e5-0609175814-00298
+
+metadata_name=loss20-moved-c22vq-muon-s8-lr6e5-0609175814-00298

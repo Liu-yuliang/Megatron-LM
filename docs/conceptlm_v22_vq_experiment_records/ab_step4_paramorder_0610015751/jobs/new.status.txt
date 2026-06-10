@@ -1,0 +1,4 @@
+06-10 02:13:07 [INFO] rjob c22vq-s4p-new-16g-0610015751-68934843 (showname=c22vq-s4p-new-16g-0610015751): Stopped
+06-10 02:13:07 [INFO]   |- task t0: 2 replicas {'active': 0, 'succeeded': 0, 'failed': 0, 'created_failed': 0, 'pending': 0, 'stopped': 2}
+06-10 02:13:07 [INFO]        |- replica c22vq-s4p-new-16g-0610015751-68934843-c4ca4: STOPPED, gpu-lg-cmc-h-h200-1337.host.h.pjlab.org.cn, 10.102.235.35
+06-10 02:13:07 [INFO]        |- replica c22vq-s4p-new-16g-0610015751-68934843-cfcd2: STOPPED, gpu-lg-cmc-h-h200-0610.host.h.pjlab.org.cn, 10.102.213.11

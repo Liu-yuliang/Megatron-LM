@@ -1,0 +1,8 @@
+date=2026-06-10T01:31:42+08:00
+base_commit=e8c0e9e3246820da5133485b60bfc58c7e4292d0
+new_commit=1ca63d1cc17d2f69afe0ae8588a8c0da8dcfdadc
+base_metadata=c22vq-s3d-base-16g-0610012914-93361608
+new_metadata=c22vq-s3d-new-16g-0610012914-99352712
+push_status=failed: github https credentials unavailable
+previous_pass=/mnt/shared-storage-gpfs2/plm-gpfs/ylliu/scale_up/train_conceptlm_V22_olmo_7B/ab_step2_routectx_rerun_0610005716/RESULT.md
+step3_change=decoder route dispatch plan; module registration and execution math unchanged

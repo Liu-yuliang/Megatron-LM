@@ -1,0 +1,17 @@
+date=2026-06-08T23:49:27+08:00
+job_name=c22vq-muon64-s8-lr6e5-scaled-opg0-0608234919
+metadata_name=c22vq-muon64-s8-lr6e5-scaled-opg0-0608234919-152d6
+model=olmo3
+entrypoint=/mnt/shared-storage-gpfs2/plm-gpfs/jyhuang/works/megatron_ConceptlmV2/examples/public_training_bench/train_olmo3_7b.sh
+repo_root=/mnt/shared-storage-gpfs2/plm-gpfs/jyhuang/works/megatron_ConceptlmV2
+submit_log=/mnt/shared-storage-gpfs2/plm-gpfs/jyhuang/runs/concept_olmo3_v22_vq_muon_64g_special8_lr6e5_scaledtrunc_opg0_retry_0608234919/run/rjob_submissions/submit_c22vq-muon64-s8-lr6e5-scaled-opg0-0608234919.log
+06-08 23:49:30 [INFO] rjob c22vq-muon64-s8-lr6e5-scaled-opg0-0608234919-152d6 (showname=c22vq-muon64-s8-lr6e5-scaled-opg0-0608234919): Inqueue
+06-08 23:49:30 [INFO]   |- task t0: 8 replicas {'active': 0, 'succeeded': 0, 'failed': 0, 'created_failed': 0, 'pending': 0, 'stopped': 0}
+06-08 23:49:30 [INFO]        |- replica c22vq-muon64-s8-lr6e5-scaled-opg0-0608234919-152d6-8f14e: STARTING, , 
+06-08 23:49:30 [INFO]        |- replica c22vq-muon64-s8-lr6e5-scaled-opg0-0608234919-152d6-eccbc: STARTING, , 
+06-08 23:49:30 [INFO]        |- replica c22vq-muon64-s8-lr6e5-scaled-opg0-0608234919-152d6-c81e7: STARTING, , 
+06-08 23:49:30 [INFO]        |- replica c22vq-muon64-s8-lr6e5-scaled-opg0-0608234919-152d6-c4ca4: STARTING, , 
+06-08 23:49:30 [INFO]        |- replica c22vq-muon64-s8-lr6e5-scaled-opg0-0608234919-152d6-a87ff: STARTING, , 
+06-08 23:49:30 [INFO]        |- replica c22vq-muon64-s8-lr6e5-scaled-opg0-0608234919-152d6-cfcd2: STARTING, , 
+06-08 23:49:30 [INFO]        |- replica c22vq-muon64-s8-lr6e5-scaled-opg0-0608234919-152d6-16790: STARTING, , 
+06-08 23:49:30 [INFO]        |- replica c22vq-muon64-s8-lr6e5-scaled-opg0-0608234919-152d6-e4da3: STARTING, , 
